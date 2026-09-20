@@ -24,6 +24,7 @@ type Sum struct {
 	inputQueue     middleware.Middleware
 	outputExchange middleware.Middleware
 	fruitItemMap   map[string]map[string]fruititem.FruitItem
+	dataPublished  map[string]bool
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -49,6 +50,7 @@ func NewSum(config SumConfig) (*Sum, error) {
 		inputQueue:     inputQueue,
 		outputExchange: outputExchange,
 		fruitItemMap:   map[string]map[string]fruititem.FruitItem{},
+		dataPublished:  map[string]bool{},
 	}, nil
 }
 
@@ -86,7 +88,7 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 func (sum *Sum) handleEndOfRecordMessage(clientID string) error {
 	slog.Info("Received End Of Records message", "client_id", clientID)
 	clientRecords := sum.fruitItemMap[clientID]
-	if len(clientRecords) > 0 {
+	if len(clientRecords) > 0 && !sum.dataPublished[clientID] {
 		fruitRecords := make([]fruititem.FruitItem, 0, len(clientRecords))
 		for _, fruitRecord := range clientRecords {
 			fruitRecords = append(fruitRecords, fruitRecord)
@@ -100,6 +102,10 @@ func (sum *Sum) handleEndOfRecordMessage(clientID string) error {
 			slog.Debug("While sending message", "err", err)
 			return err
 		}
+		if sum.dataPublished == nil {
+			sum.dataPublished = map[string]bool{}
+		}
+		sum.dataPublished[clientID] = true
 	}
 
 	message, err := inner.SerializeMessage(inner.MessageTypeEOF, clientID, []fruititem.FruitItem{})
@@ -112,6 +118,7 @@ func (sum *Sum) handleEndOfRecordMessage(clientID string) error {
 		return err
 	}
 	delete(sum.fruitItemMap, clientID)
+	delete(sum.dataPublished, clientID)
 	return nil
 }
 
