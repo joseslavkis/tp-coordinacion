@@ -47,8 +47,10 @@ func (join *Join) Run() {
 }
 
 func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) {
-	defer ack()
 	if err := join.outputQueue.Send(msg); err != nil {
 		slog.Error("While sending top", "err", err)
+		nack()
+		return
 	}
+	ack()
 }
