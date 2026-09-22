@@ -13,7 +13,8 @@ import (
 const clientIDBytes = 16
 
 type MessageHandler struct {
-	clientID string
+	clientID      string
+	totalMessages uint64
 }
 
 func NewMessageHandler() MessageHandler {
@@ -25,11 +26,16 @@ func NewMessageHandler() MessageHandler {
 }
 
 func (messageHandler *MessageHandler) SerializeDataMessage(fruitRecord fruititem.FruitItem) (*middleware.Message, error) {
-	return inner.SerializeMessage(inner.MessageTypeData, messageHandler.clientID, []fruititem.FruitItem{fruitRecord})
+	message, err := inner.SerializeDataMessage(messageHandler.clientID, []fruititem.FruitItem{fruitRecord})
+	if err != nil {
+		return nil, err
+	}
+	messageHandler.totalMessages++
+	return message, nil
 }
 
 func (messageHandler *MessageHandler) SerializeEOFMessage() (*middleware.Message, error) {
-	return inner.SerializeMessage(inner.MessageTypeEOF, messageHandler.clientID, []fruititem.FruitItem{})
+	return inner.SerializeEOFMessage(messageHandler.clientID, messageHandler.totalMessages)
 }
 
 func (messageHandler *MessageHandler) DeserializeResultMessage(message *middleware.Message) ([]fruititem.FruitItem, error) {
