@@ -23,21 +23,21 @@ type SumConfig struct {
 }
 
 type Sum struct {
-	mu              sync.Mutex
-	inputQueue      middleware.Middleware
-	outputExchange  middleware.Middleware
-	controlInput    middleware.Middleware
-	controlOutput   middleware.Middleware
-	id              int
-	sumAmount       int
-	fruitItemMap    map[string]map[string]fruititem.FruitItem
-	processedCount  map[string]uint64
-	barriers        map[string]*clientBarrierState
-	countRounds     map[tokenKey]*countRoundProgress
-	finishRounds    map[tokenKey]*finishRoundProgress
-	finishTombstone map[tokenKey]struct{}
-	countRetryDelay countRetryDelayFunc
-	countRetryTimer countRetryScheduler
+	mu               sync.Mutex
+	inputQueue       middleware.Middleware
+	outputExchange   middleware.Middleware
+	controlInput     middleware.Middleware
+	controlOutput    middleware.Middleware
+	id               int
+	sumAmount        int
+	fruitItemMap     map[string]map[string]fruititem.FruitItem
+	processedCount   map[string]uint64
+	barriers         map[string]*clientBarrierState
+	countRounds      map[tokenKey]*countRoundProgress
+	finishRounds     map[tokenKey]*finishRoundProgress
+	completedClients map[string]struct{}
+	countRetryDelay  countRetryDelayFunc
+	countRetryTimer  countRetryScheduler
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -82,20 +82,20 @@ func NewSum(config SumConfig) (*Sum, error) {
 	}
 
 	return &Sum{
-		inputQueue:      inputQueue,
-		outputExchange:  outputExchange,
-		controlInput:    controlInput,
-		controlOutput:   controlOutput,
-		id:              config.Id,
-		sumAmount:       config.SumAmount,
-		fruitItemMap:    map[string]map[string]fruititem.FruitItem{},
-		processedCount:  map[string]uint64{},
-		barriers:        map[string]*clientBarrierState{},
-		countRounds:     map[tokenKey]*countRoundProgress{},
-		finishRounds:    map[tokenKey]*finishRoundProgress{},
-		finishTombstone: map[tokenKey]struct{}{},
-		countRetryDelay: defaultCountRetryDelay,
-		countRetryTimer: defaultCountRetryScheduler,
+		inputQueue:       inputQueue,
+		outputExchange:   outputExchange,
+		controlInput:     controlInput,
+		controlOutput:    controlOutput,
+		id:               config.Id,
+		sumAmount:        config.SumAmount,
+		fruitItemMap:     map[string]map[string]fruititem.FruitItem{},
+		processedCount:   map[string]uint64{},
+		barriers:         map[string]*clientBarrierState{},
+		countRounds:      map[tokenKey]*countRoundProgress{},
+		finishRounds:     map[tokenKey]*finishRoundProgress{},
+		completedClients: map[string]struct{}{},
+		countRetryDelay:  defaultCountRetryDelay,
+		countRetryTimer:  defaultCountRetryScheduler,
 	}, nil
 }
 

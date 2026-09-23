@@ -346,7 +346,7 @@ func (sum *Sum) retryCountRound(clientID string, previousRound, generation uint6
 	}
 }
 
-func (sum *Sum) removeClientStateLocked(clientID string, tombstone *tokenKey) countRetryCancel {
+func (sum *Sum) removeClientStateLocked(clientID string) countRetryCancel {
 	var cancel countRetryCancel
 	if barrier := sum.barriers[clientID]; barrier != nil {
 		barrier.timerGeneration++
@@ -365,17 +365,11 @@ func (sum *Sum) removeClientStateLocked(clientID string, tombstone *tokenKey) co
 			delete(sum.finishRounds, key)
 		}
 	}
-	if tombstone != nil {
-		sum.finishTombstone[*tombstone] = struct{}{}
-	}
+	sum.completedClients[clientID] = struct{}{}
 	return cancel
 }
 
 func (sum *Sum) hasFinishedClientLocked(clientID string) bool {
-	for key := range sum.finishTombstone {
-		if key.clientID == clientID {
-			return true
-		}
-	}
-	return false
+	_, completed := sum.completedClients[clientID]
+	return completed
 }

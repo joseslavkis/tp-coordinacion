@@ -31,7 +31,7 @@ func (sum *Sum) handleFinishToken(envelope inner.Envelope) error {
 	key := tokenKey{clientID: envelope.ClientID, leaderID: envelope.LeaderID, round: envelope.Round}
 
 	sum.mu.Lock()
-	if _, completed := sum.finishTombstone[key]; completed {
+	if _, completed := sum.completedClients[envelope.ClientID]; completed {
 		sum.mu.Unlock()
 		return nil
 	}
@@ -49,7 +49,7 @@ func (sum *Sum) handleFinishToken(envelope inner.Envelope) error {
 			slog.Error("Discarding FINISH for unknown leader round", "client_id", envelope.ClientID, "round", envelope.Round)
 			return nil
 		}
-		cancel := sum.removeClientStateLocked(envelope.ClientID, &key)
+		cancel := sum.removeClientStateLocked(envelope.ClientID)
 		sum.mu.Unlock()
 		if cancel != nil {
 			cancel()
@@ -178,7 +178,7 @@ func (sum *Sum) forwardFinish(key tokenKey, progress *finishRoundProgress) error
 	if current := sum.finishRounds[key]; current == progress {
 		progress.forwarded = true
 		if key.leaderID != sum.id {
-			cancel = sum.removeClientStateLocked(key.clientID, &key)
+			cancel = sum.removeClientStateLocked(key.clientID)
 		}
 	}
 	sum.mu.Unlock()
