@@ -32,13 +32,12 @@ type Sum struct {
 	sumAmount       int
 	fruitItemMap    map[string]map[string]fruititem.FruitItem
 	processedCount  map[string]uint64
-	dataPublished   map[string]bool
 	barriers        map[string]*clientBarrierState
 	countRounds     map[tokenKey]*countRoundProgress
 	finishRounds    map[tokenKey]*finishRoundProgress
-	outboundActions map[outboundKey]*outboundAction
-	retryDelay      retryDelayFunc
-	retryScheduler  retryScheduler
+	finishTombstone map[tokenKey]struct{}
+	countRetryDelay countRetryDelayFunc
+	countRetryTimer countRetryScheduler
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -82,19 +81,22 @@ func NewSum(config SumConfig) (*Sum, error) {
 		return nil, err
 	}
 
-	sum := &Sum{
-		inputQueue:     inputQueue,
-		outputExchange: outputExchange,
-		controlInput:   controlInput,
-		controlOutput:  controlOutput,
-		id:             config.Id,
-		sumAmount:      config.SumAmount,
-		fruitItemMap:   map[string]map[string]fruititem.FruitItem{},
-		processedCount: map[string]uint64{},
-		dataPublished:  map[string]bool{},
-	}
-	sum.initializeControlState()
-	return sum, nil
+	return &Sum{
+		inputQueue:      inputQueue,
+		outputExchange:  outputExchange,
+		controlInput:    controlInput,
+		controlOutput:   controlOutput,
+		id:              config.Id,
+		sumAmount:       config.SumAmount,
+		fruitItemMap:    map[string]map[string]fruititem.FruitItem{},
+		processedCount:  map[string]uint64{},
+		barriers:        map[string]*clientBarrierState{},
+		countRounds:     map[tokenKey]*countRoundProgress{},
+		finishRounds:    map[tokenKey]*finishRoundProgress{},
+		finishTombstone: map[tokenKey]struct{}{},
+		countRetryDelay: defaultCountRetryDelay,
+		countRetryTimer: defaultCountRetryScheduler,
+	}, nil
 }
 
 func (sum *Sum) Run() {
@@ -117,8 +119,8 @@ func (sum *Sum) Run() {
 func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	envelope, err := inner.DeserializeMessage(&msg)
 	if err != nil {
-		slog.Error("While deserializing message", "err", err)
-		nack()
+		slog.Error("Discarding malformed Sum working-queue message", "err", err)
+		ack()
 		return
 	}
 
@@ -126,18 +128,14 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	case inner.MessageTypeData:
 		sum.handleDataMessage(envelope.ClientID, envelope.Records)
 	case inner.MessageTypeEOF:
-		if sum.sumAmount == 0 || sum.controlOutput == nil {
-			err = sum.handleLegacyEndOfRecordMessage(envelope.ClientID)
-		} else {
-			err = sum.handleEndOfRecordMessage(envelope.ClientID, envelope.TotalMessages)
-		}
-		if err != nil {
-			slog.Error("While handling end of record message", "err", err)
-			nack()
-			return
-		}
+		err = sum.handleEndOfRecordMessage(envelope.ClientID, envelope.TotalMessages)
 	default:
-		slog.Error("Unexpected message type", "type", envelope.Type)
+		slog.Error("Discarding unexpected Sum working-queue message", "type", envelope.Type)
+		ack()
+		return
+	}
+	if err != nil {
+		slog.Error("While forwarding Sum working-queue completion message", "type", envelope.Type, "client_id", envelope.ClientID, "err", err)
 		nack()
 		return
 	}
@@ -146,69 +144,51 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 
 func (sum *Sum) handleEndOfRecordMessage(clientID string, totalMessages uint64) error {
 	sum.mu.Lock()
-	sum.initializeControlStateLocked()
-	if existing, ok := sum.barriers[clientID]; ok {
-		if existing.expected != totalMessages {
-			sum.mu.Unlock()
-			return fmt.Errorf("client %q EOF total changed from %d to %d", clientID, existing.expected, totalMessages)
-		}
+	if sum.hasFinishedClientLocked(clientID) {
+		sum.mu.Unlock()
+		slog.Error("Discarding late EOF for completed client", "client_id", clientID)
+		return nil
+	}
+	barrier, ok := sum.barriers[clientID]
+	if !ok {
+		barrier = &clientBarrierState{expected: totalMessages, leaderID: sum.id}
+		sum.barriers[clientID] = barrier
+		sum.mu.Unlock()
+		return sum.startCountRound(clientID)
+	}
+	if barrier.expected != totalMessages {
+		sum.mu.Unlock()
+		slog.Error("Discarding conflicting duplicate EOF", "client_id", clientID, "expected", barrier.expected, "got", totalMessages)
+		return nil
+	}
+	if barrier.barrierPassed {
 		sum.mu.Unlock()
 		return nil
 	}
-	sum.barriers[clientID] = &clientBarrierState{expected: totalMessages, leaderID: sum.id}
-	sum.mu.Unlock()
-
-	return sum.startCountRound(clientID)
-}
-
-func (sum *Sum) handleLegacyEndOfRecordMessage(clientID string) error {
-	slog.Info("Received End Of Records message", "client_id", clientID)
-
-	sum.mu.Lock()
-	clientRecords := sum.fruitItemMap[clientID]
-	dataPublished := sum.dataPublished[clientID]
-	fruitRecords := copyFruitRecords(clientRecords)
-	sum.mu.Unlock()
-
-	if len(fruitRecords) > 0 && !dataPublished {
-		message, err := inner.SerializeDataMessage(clientID, fruitRecords)
-		if err != nil {
-			return err
-		}
-		if err := sum.outputExchange.Send(*message); err != nil {
-			return err
-		}
-		sum.mu.Lock()
-		if sum.dataPublished == nil {
-			sum.dataPublished = map[string]bool{}
-		}
-		sum.dataPublished[clientID] = true
+	if barrier.round == 0 {
 		sum.mu.Unlock()
+		return sum.startCountRound(clientID)
 	}
-
-	message, err := inner.SerializeEOFMessage(clientID, 0)
-	if err != nil {
-		return err
+	key := tokenKey{clientID: clientID, leaderID: sum.id, round: barrier.round}
+	progress := sum.countRounds[key]
+	if progress == nil || progress.returned {
+		sum.mu.Unlock()
+		return sum.startCountRound(clientID)
 	}
-	if err := sum.outputExchange.Send(*message); err != nil {
-		return err
+	if progress.forwarded {
+		sum.mu.Unlock()
+		return nil
 	}
-	sum.mu.Lock()
-	delete(sum.fruitItemMap, clientID)
-	delete(sum.processedCount, clientID)
-	delete(sum.dataPublished, clientID)
 	sum.mu.Unlock()
-	return nil
+	return sum.forwardCount(key, progress)
 }
 
 func (sum *Sum) handleDataMessage(clientID string, fruitRecords []fruititem.FruitItem) {
 	sum.mu.Lock()
 	defer sum.mu.Unlock()
-	if sum.fruitItemMap == nil {
-		sum.fruitItemMap = map[string]map[string]fruititem.FruitItem{}
-	}
-	if sum.processedCount == nil {
-		sum.processedCount = map[string]uint64{}
+	if sum.hasFinishedClientLocked(clientID) {
+		slog.Error("Discarding late DATA for completed client", "client_id", clientID)
+		return
 	}
 	clientRecords, ok := sum.fruitItemMap[clientID]
 	if !ok {
