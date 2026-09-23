@@ -60,19 +60,6 @@ type serializableEnvelope struct {
 	Visited       *uint64           `json:"visited,omitempty"`
 }
 
-func SerializeMessage(messageType MessageType, clientID string, records []fruititem.FruitItem) (*middleware.Message, error) {
-	switch messageType {
-	case MessageTypeData:
-		return SerializeDataMessage(clientID, records)
-	case MessageTypeEOF:
-		return SerializeEOFMessage(clientID, 0)
-	case MessageTypeResult:
-		return SerializeResultMessage(clientID, records)
-	default:
-		return nil, fmt.Errorf("message type %q requires typed metadata", messageType)
-	}
-}
-
 func SerializeDataMessage(clientID string, records []fruititem.FruitItem) (*middleware.Message, error) {
 	return serializeEnvelope(Envelope{Type: MessageTypeData, ClientID: clientID, Records: records})
 }
