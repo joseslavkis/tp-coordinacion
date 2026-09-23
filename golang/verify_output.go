@@ -168,7 +168,7 @@ func verifyClientOutput(topSize int, svc service) error {
 			received = fruititem.FruitItem{Fruit: "-", Amount: 0}
 		}
 
-		if expected.Fruit == received.Fruit && expected.Amount == received.Amount {
+		if expected == received {
 			log.Printf("%-16s %5d", received.Fruit, received.Amount)
 		} else {
 			log.Printf("%-16s %5d - Expected: %-16s %5d", received.Fruit, received.Amount, expected.Fruit, expected.Amount)
