@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -29,6 +30,11 @@ type aggregationKey struct {
 	round    uint64
 }
 
+const (
+	completedRoundTTL           = 5 * time.Minute
+	completedRoundSweepInterval = 100
+)
+
 type aggregationRound struct {
 	records          map[string]fruititem.FruitItem
 	receivedPartials map[int]struct{}
@@ -49,14 +55,15 @@ func (err *poisonError) Unwrap() error {
 }
 
 type Aggregation struct {
-	mu            sync.Mutex
-	outputQueue   middleware.Middleware
-	inputExchange middleware.Middleware
-	topSize       int
-	sumAmount     int
-	rounds        map[aggregationKey]*aggregationRound
-	roundByClient map[string]uint64
-	completed     map[aggregationKey]struct{}
+	mu                  sync.Mutex
+	outputQueue         middleware.Middleware
+	inputExchange       middleware.Middleware
+	topSize             int
+	sumAmount           int
+	rounds              map[aggregationKey]*aggregationRound
+	roundByClient       map[string]uint64
+	completed           map[aggregationKey]time.Time
+	completedSinceSweep int
 }
 
 func NewAggregation(config AggregationConfig) (*Aggregation, error) {
@@ -84,7 +91,7 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 		sumAmount:     config.SumAmount,
 		rounds:        map[aggregationKey]*aggregationRound{},
 		roundByClient: map[string]uint64{},
-		completed:     map[aggregationKey]struct{}{},
+		completed:     map[aggregationKey]time.Time{},
 	}, nil
 }
 
@@ -188,8 +195,11 @@ func (aggregation *Aggregation) validateSumID(sumID int) error {
 }
 
 func (aggregation *Aggregation) roundForEnvelopeLocked(key aggregationKey) (*aggregationRound, bool, error) {
-	if _, ok := aggregation.completed[key]; ok {
-		return nil, true, nil
+	if completedAt, completed := aggregation.completed[key]; completed {
+		if time.Since(completedAt) < completedRoundTTL {
+			return nil, true, nil
+		}
+		delete(aggregation.completed, key)
 	}
 	if activeRound, ok := aggregation.roundByClient[key.clientID]; ok && activeRound != key.round {
 		return nil, false, &poisonError{err: fmt.Errorf("client %q active round is %d, got %d", key.clientID, activeRound, key.round)}
@@ -237,12 +247,29 @@ func (aggregation *Aggregation) publishResult(key aggregationKey, round *aggrega
 
 	aggregation.mu.Lock()
 	if aggregation.rounds[key] == round {
-		aggregation.completed[key] = struct{}{}
+		aggregation.recordCompletedRoundLocked(key)
 		delete(aggregation.rounds, key)
 		delete(aggregation.roundByClient, key.clientID)
 	}
 	aggregation.mu.Unlock()
 	return nil
+}
+
+func (aggregation *Aggregation) recordCompletedRoundLocked(key aggregationKey) {
+	aggregation.completed[key] = time.Now()
+	aggregation.completedSinceSweep++
+	if aggregation.completedSinceSweep >= completedRoundSweepInterval {
+		aggregation.sweepCompletedRoundsLocked(time.Now())
+	}
+}
+
+func (aggregation *Aggregation) sweepCompletedRoundsLocked(now time.Time) {
+	for key, completedAt := range aggregation.completed {
+		if now.Sub(completedAt) >= completedRoundTTL {
+			delete(aggregation.completed, key)
+		}
+	}
+	aggregation.completedSinceSweep = 0
 }
 
 func buildFruitTop(records map[string]fruititem.FruitItem, topSize int) []fruititem.FruitItem {

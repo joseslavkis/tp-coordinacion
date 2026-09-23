@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -23,21 +24,22 @@ type SumConfig struct {
 }
 
 type Sum struct {
-	mu               sync.Mutex
-	inputQueue       middleware.Middleware
-	outputExchange   middleware.Middleware
-	controlInput     middleware.Middleware
-	controlOutput    middleware.Middleware
-	id               int
-	sumAmount        int
-	fruitItemMap     map[string]map[string]fruititem.FruitItem
-	processedCount   map[string]uint64
-	barriers         map[string]*clientBarrierState
-	countRounds      map[tokenKey]*countRoundProgress
-	finishRounds     map[tokenKey]*finishRoundProgress
-	completedClients map[string]struct{}
-	countRetryDelay  countRetryDelayFunc
-	countRetryTimer  countRetryScheduler
+	mu                  sync.Mutex
+	inputQueue          middleware.Middleware
+	outputExchange      middleware.Middleware
+	controlInput        middleware.Middleware
+	controlOutput       middleware.Middleware
+	id                  int
+	sumAmount           int
+	fruitItemMap        map[string]map[string]fruititem.FruitItem
+	processedCount      map[string]uint64
+	barriers            map[string]*clientBarrierState
+	countRounds         map[tokenKey]*countRoundProgress
+	finishRounds        map[tokenKey]*finishRoundProgress
+	completedClients    map[string]time.Time
+	completedSinceSweep int
+	countRetryDelay     countRetryDelayFunc
+	countRetryTimer     countRetryScheduler
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -93,7 +95,7 @@ func NewSum(config SumConfig) (*Sum, error) {
 		barriers:         map[string]*clientBarrierState{},
 		countRounds:      map[tokenKey]*countRoundProgress{},
 		finishRounds:     map[tokenKey]*finishRoundProgress{},
-		completedClients: map[string]struct{}{},
+		completedClients: map[string]time.Time{},
 		countRetryDelay:  defaultCountRetryDelay,
 		countRetryTimer:  defaultCountRetryScheduler,
 	}, nil

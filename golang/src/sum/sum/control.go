@@ -13,8 +13,10 @@ import (
 )
 
 const (
-	countRetryBaseDelay = 25 * time.Millisecond
-	countRetryMaxDelay  = time.Second
+	countRetryBaseDelay          = 25 * time.Millisecond
+	countRetryMaxDelay           = time.Second
+	completedClientTTL           = 5 * time.Minute
+	completedClientSweepInterval = 100
 )
 
 type countRetryDelayFunc func(attempt uint) time.Duration
@@ -365,11 +367,35 @@ func (sum *Sum) removeClientStateLocked(clientID string) countRetryCancel {
 			delete(sum.finishRounds, key)
 		}
 	}
-	sum.completedClients[clientID] = struct{}{}
+	sum.recordCompletedClientLocked(clientID)
 	return cancel
 }
 
+func (sum *Sum) recordCompletedClientLocked(clientID string) {
+	sum.completedClients[clientID] = time.Now()
+	sum.completedSinceSweep++
+	if sum.completedSinceSweep >= completedClientSweepInterval {
+		sum.sweepCompletedClientsLocked(time.Now())
+	}
+}
+
+func (sum *Sum) sweepCompletedClientsLocked(now time.Time) {
+	for clientID, completedAt := range sum.completedClients {
+		if now.Sub(completedAt) >= completedClientTTL {
+			delete(sum.completedClients, clientID)
+		}
+	}
+	sum.completedSinceSweep = 0
+}
+
 func (sum *Sum) hasFinishedClientLocked(clientID string) bool {
-	_, completed := sum.completedClients[clientID]
-	return completed
+	completedAt, completed := sum.completedClients[clientID]
+	if !completed {
+		return false
+	}
+	if time.Since(completedAt) >= completedClientTTL {
+		delete(sum.completedClients, clientID)
+		return false
+	}
+	return true
 }

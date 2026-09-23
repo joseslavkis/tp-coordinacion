@@ -31,7 +31,7 @@ func (sum *Sum) handleFinishToken(envelope inner.Envelope) error {
 	key := tokenKey{clientID: envelope.ClientID, leaderID: envelope.LeaderID, round: envelope.Round}
 
 	sum.mu.Lock()
-	if _, completed := sum.completedClients[envelope.ClientID]; completed {
+	if sum.hasFinishedClientLocked(envelope.ClientID) {
 		sum.mu.Unlock()
 		return nil
 	}
