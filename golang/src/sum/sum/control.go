@@ -56,7 +56,6 @@ type finishRoundProgress struct {
 	records          []fruititem.FruitItem
 	outboundVisited  uint64
 	partialPublished bool
-	donePublished    bool
 	forwarded        bool
 }
 
