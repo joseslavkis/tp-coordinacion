@@ -34,6 +34,7 @@ type Sum struct {
 	fruitItemMap        map[string]map[string]fruititem.FruitItem
 	processedCount      map[string]uint64
 	barriers            map[string]*clientBarrierState
+	initForwards        map[initForwardKey]*initForwardProgress
 	countRounds         map[tokenKey]*countRoundProgress
 	finishRounds        map[tokenKey]*finishRoundProgress
 	completedClients    map[string]time.Time
@@ -93,6 +94,7 @@ func NewSum(config SumConfig) (*Sum, error) {
 		fruitItemMap:     map[string]map[string]fruititem.FruitItem{},
 		processedCount:   map[string]uint64{},
 		barriers:         map[string]*clientBarrierState{},
+		initForwards:     map[initForwardKey]*initForwardProgress{},
 		countRounds:      map[tokenKey]*countRoundProgress{},
 		finishRounds:     map[tokenKey]*finishRoundProgress{},
 		completedClients: map[string]time.Time{},
@@ -151,38 +153,12 @@ func (sum *Sum) handleEndOfRecordMessage(clientID string, totalMessages uint64) 
 		slog.Error("Discarding late EOF for completed client", "client_id", clientID)
 		return nil
 	}
-	barrier, ok := sum.barriers[clientID]
-	if !ok {
-		barrier = &clientBarrierState{expected: totalMessages, leaderID: sum.id}
-		sum.barriers[clientID] = barrier
-		sum.mu.Unlock()
-		return sum.startCountRound(clientID)
-	}
-	if barrier.expected != totalMessages {
-		sum.mu.Unlock()
-		slog.Error("Discarding conflicting duplicate EOF", "client_id", clientID, "expected", barrier.expected, "got", totalMessages)
-		return nil
-	}
-	if barrier.barrierPassed {
-		sum.mu.Unlock()
-		return nil
-	}
-	if barrier.round == 0 {
-		sum.mu.Unlock()
-		return sum.startCountRound(clientID)
-	}
-	key := tokenKey{clientID: clientID, leaderID: sum.id, round: barrier.round}
-	progress := sum.countRounds[key]
-	if progress == nil || progress.returned {
-		sum.mu.Unlock()
-		return sum.startCountRound(clientID)
-	}
-	if progress.forwarded {
-		sum.mu.Unlock()
-		return nil
-	}
 	sum.mu.Unlock()
-	return sum.forwardCount(key, progress)
+	leaderID := leaderForClient(clientID, sum.sumAmount)
+	if leaderID == sum.id {
+		return sum.initializeBarrier(clientID, totalMessages)
+	}
+	return sum.forwardBarrierInit(clientID, leaderID, totalMessages, 1)
 }
 
 func (sum *Sum) handleDataMessage(clientID string, fruitRecords []fruititem.FruitItem) {

@@ -2,6 +2,7 @@ package sum
 
 import (
 	"fmt"
+	"hash/crc32"
 	"log/slog"
 	"math"
 	"math/rand/v2"
@@ -49,14 +50,28 @@ type countRoundProgress struct {
 	outboundCount   uint64
 	outboundVisited uint64
 	forwarded       bool
+	sending         bool
 	returned        bool
+}
+
+type initForwardKey struct {
+	clientID string
+	visited  uint64
+}
+
+type initForwardProgress struct {
+	expected  uint64
+	forwarded bool
+	sending   bool
 }
 
 type finishRoundProgress struct {
 	records          []fruititem.FruitItem
 	outboundVisited  uint64
 	partialPublished bool
+	partialSending   bool
 	forwarded        bool
+	forwardSending   bool
 }
 
 func controlQueueName(prefix string, id int) string {
@@ -65,6 +80,80 @@ func controlQueueName(prefix string, id int) string {
 
 func successorID(id, sumAmount int) int {
 	return (id + 1) % sumAmount
+}
+
+func leaderForClient(clientID string, sumAmount int) int {
+	// CRC32/IEEE is stable across processes and keeps existing client-a fixtures on Sum 0.
+	return int(uint64(crc32.ChecksumIEEE([]byte(clientID))) % uint64(sumAmount))
+}
+
+func (sum *Sum) initializeBarrier(clientID string, expected uint64) error {
+	sum.mu.Lock()
+	if sum.hasFinishedClientLocked(clientID) {
+		sum.mu.Unlock()
+		return nil
+	}
+	barrier := sum.barriers[clientID]
+	if barrier == nil {
+		barrier = &clientBarrierState{expected: expected, leaderID: sum.id}
+		sum.barriers[clientID] = barrier
+	} else if barrier.expected != expected {
+		sum.mu.Unlock()
+		slog.Error("Discarding conflicting barrier initiation", "client_id", clientID, "expected", barrier.expected, "got", expected)
+		return nil
+	}
+	sum.mu.Unlock()
+	return sum.startCountRound(clientID, false)
+}
+
+func (sum *Sum) forwardBarrierInit(clientID string, leaderID int, expected, visited uint64) error {
+	key := initForwardKey{clientID: clientID, visited: visited}
+	sum.mu.Lock()
+	if sum.hasFinishedClientLocked(clientID) {
+		sum.mu.Unlock()
+		return nil
+	}
+	progress := sum.initForwards[key]
+	if progress == nil {
+		progress = &initForwardProgress{expected: expected}
+		if sum.initForwards == nil {
+			sum.initForwards = map[initForwardKey]*initForwardProgress{}
+		}
+		sum.initForwards[key] = progress
+	} else if progress.expected != expected || progress.forwarded {
+		sum.mu.Unlock()
+		return nil
+	} else if progress.sending {
+		sum.mu.Unlock()
+		return fmt.Errorf("barrier initiation already sending for %s", clientID)
+	}
+	progress.sending = true
+	sum.mu.Unlock()
+
+	message, err := inner.SerializeBarrierInitMessage(clientID, leaderID, expected, visited)
+	if err == nil {
+		err = sum.controlOutput.Send(*message)
+	}
+	sum.mu.Lock()
+	if sum.initForwards[key] == progress {
+		progress.sending = false
+		if err == nil {
+			progress.forwarded = true
+		}
+	}
+	sum.mu.Unlock()
+	return err
+}
+
+func (sum *Sum) handleBarrierInit(envelope inner.Envelope) error {
+	if envelope.LeaderID == sum.id {
+		return sum.initializeBarrier(envelope.ClientID, envelope.TotalMessages)
+	}
+	if envelope.Visited >= uint64(sum.sumAmount) {
+		slog.Error("Discarding exhausted BARRIER_INIT", "client_id", envelope.ClientID, "visited", envelope.Visited)
+		return nil
+	}
+	return sum.forwardBarrierInit(envelope.ClientID, envelope.LeaderID, envelope.TotalMessages, envelope.Visited+1)
 }
 
 func jitteredBackoff(attempt uint, sample uint64) time.Duration {
@@ -93,7 +182,8 @@ func defaultCountRetryScheduler(delay time.Duration, callback func()) countRetry
 	return func() { timer.Stop() }
 }
 
-func (sum *Sum) startCountRound(clientID string) error {
+// Only the incomplete-round timer may advance a returned COUNT to the next round.
+func (sum *Sum) startCountRound(clientID string, advance bool) error {
 	sum.mu.Lock()
 	barrier := sum.barriers[clientID]
 	if barrier == nil || barrier.barrierPassed || barrier.timerPending {
@@ -112,6 +202,10 @@ func (sum *Sum) startCountRound(clientID string) error {
 			sum.mu.Unlock()
 			return sum.forwardCount(key, progress)
 		}
+		if !advance {
+			sum.mu.Unlock()
+			return nil
+		}
 	}
 
 	barrier.round++
@@ -129,20 +223,32 @@ func (sum *Sum) startCountRound(clientID string) error {
 }
 
 func (sum *Sum) forwardCount(key tokenKey, progress *countRoundProgress) error {
+	sum.mu.Lock()
+	if sum.countRounds[key] != progress || progress.forwarded {
+		sum.mu.Unlock()
+		return nil
+	}
+	if progress.sending {
+		sum.mu.Unlock()
+		return fmt.Errorf("COUNT already sending for %s", key.clientID)
+	}
+	progress.sending = true
+	sum.mu.Unlock()
 	message, err := inner.SerializeCountMessage(key.clientID, key.leaderID, key.round, progress.expected, progress.outboundCount, progress.outboundVisited)
 	if err != nil {
 		slog.Error("Discarding invalid COUNT state", "client_id", key.clientID, "round", key.round, "err", err)
-		return nil
-	}
-	if err := sum.controlOutput.Send(*message); err != nil {
-		return err
+	} else {
+		err = sum.controlOutput.Send(*message)
 	}
 	sum.mu.Lock()
 	if current := sum.countRounds[key]; current == progress {
-		current.forwarded = true
+		current.sending = false
+		if err == nil {
+			current.forwarded = true
+		}
 	}
 	sum.mu.Unlock()
-	return nil
+	return err
 }
 
 func (sum *Sum) handleControlMessage(msg middleware.Message, ack func(), nack func()) {
@@ -152,18 +258,20 @@ func (sum *Sum) handleControlMessage(msg middleware.Message, ack func(), nack fu
 		ack()
 		return
 	}
-	if envelope.Type != inner.MessageTypeCount && envelope.Type != inner.MessageTypeFinish {
+	if envelope.Type != inner.MessageTypeCount && envelope.Type != inner.MessageTypeFinish && envelope.Type != inner.MessageTypeBarrierInit {
 		slog.Error("Discarding unexpected Sum control message", "type", envelope.Type)
 		ack()
 		return
 	}
-	if sum.sumAmount <= 0 || envelope.LeaderID < 0 || envelope.LeaderID >= sum.sumAmount || envelope.Visited == 0 || envelope.Visited > uint64(sum.sumAmount) {
+	if sum.sumAmount <= 0 || envelope.LeaderID < 0 || envelope.LeaderID >= sum.sumAmount || envelope.LeaderID != leaderForClient(envelope.ClientID, sum.sumAmount) || envelope.Visited == 0 || envelope.Visited > uint64(sum.sumAmount) {
 		slog.Error("Discarding invalid Sum control metadata", "client_id", envelope.ClientID, "leader_id", envelope.LeaderID, "visited", envelope.Visited, "sum_amount", sum.sumAmount)
 		ack()
 		return
 	}
 
 	switch envelope.Type {
+	case inner.MessageTypeBarrierInit:
+		err = sum.handleBarrierInit(envelope)
 	case inner.MessageTypeCount:
 		err = sum.handleCountToken(envelope)
 	case inner.MessageTypeFinish:
@@ -332,7 +440,7 @@ func (sum *Sum) retryCountRound(clientID string, previousRound, generation uint6
 	barrier.timerCancel = nil
 	sum.mu.Unlock()
 
-	if err := sum.startCountRound(clientID); err != nil {
+	if err := sum.startCountRound(clientID, true); err != nil {
 		slog.Warn("While sending COUNT retry", "client_id", clientID, "err", err)
 		sum.mu.Lock()
 		barrier = sum.barriers[clientID]
@@ -356,6 +464,11 @@ func (sum *Sum) removeClientStateLocked(clientID string) countRetryCancel {
 	delete(sum.fruitItemMap, clientID)
 	delete(sum.processedCount, clientID)
 	delete(sum.barriers, clientID)
+	for key := range sum.initForwards {
+		if key.clientID == clientID {
+			delete(sum.initForwards, key)
+		}
+	}
 	for key := range sum.countRounds {
 		if key.clientID == clientID {
 			delete(sum.countRounds, key)

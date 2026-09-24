@@ -15,12 +15,13 @@ import (
 type MessageType string
 
 const (
-	MessageTypeData    MessageType = "data"
-	MessageTypeEOF     MessageType = "eof"
-	MessageTypePartial MessageType = "partial"
-	MessageTypeResult  MessageType = "result"
-	MessageTypeCount   MessageType = "count"
-	MessageTypeFinish  MessageType = "finish"
+	MessageTypeData        MessageType = "data"
+	MessageTypeEOF         MessageType = "eof"
+	MessageTypePartial     MessageType = "partial"
+	MessageTypeResult      MessageType = "result"
+	MessageTypeCount       MessageType = "count"
+	MessageTypeFinish      MessageType = "finish"
+	MessageTypeBarrierInit MessageType = "barrier_init"
 )
 
 type Envelope struct {
@@ -87,6 +88,13 @@ func SerializeCountMessage(clientID string, leaderID int, round, expected, count
 	})
 }
 
+func SerializeBarrierInitMessage(clientID string, leaderID int, expected, visited uint64) (*middleware.Message, error) {
+	return serializeEnvelope(Envelope{
+		Type: MessageTypeBarrierInit, ClientID: clientID, LeaderID: leaderID,
+		TotalMessages: expected, Visited: visited,
+	})
+}
+
 func SerializeFinishMessage(clientID string, leaderID int, round, visited uint64) (*middleware.Message, error) {
 	return serializeEnvelope(Envelope{
 		Type:     MessageTypeFinish,
@@ -112,6 +120,10 @@ func serializeEnvelope(envelope Envelope) (*middleware.Message, error) {
 		wire.Records = &records
 	case MessageTypeEOF:
 		wire.TotalMessages = &envelope.TotalMessages
+	case MessageTypeBarrierInit:
+		wire.LeaderID = &envelope.LeaderID
+		wire.TotalMessages = &envelope.TotalMessages
+		wire.Visited = &envelope.Visited
 	case MessageTypeCount:
 		wire.LeaderID = &envelope.LeaderID
 		wire.Round = &envelope.Round
@@ -152,8 +164,7 @@ func DeserializeMessage(message *middleware.Message) (Envelope, error) {
 	if err := json.Unmarshal([]byte(message.Body), &wireFields); err != nil {
 		return Envelope{}, fmt.Errorf("decode inner envelope fields: %w", err)
 	}
-	_, roundPresent := wireFields["round"]
-	if err := validateWireShape(wire, roundPresent); err != nil {
+	if err := validateWireShape(wire, wireFields); err != nil {
 		return Envelope{}, err
 	}
 
@@ -196,7 +207,8 @@ func copyMetadata(envelope *Envelope, wire wireEnvelope) {
 	}
 }
 
-func validateWireShape(wire wireEnvelope, roundPresent bool) error {
+func validateWireShape(wire wireEnvelope, fields map[string]json.RawMessage) error {
+	_, roundPresent := fields["round"]
 	records := wire.Records != nil
 	total := wire.TotalMessages != nil
 	sumID := wire.SumID != nil
@@ -219,6 +231,13 @@ func validateWireShape(wire wireEnvelope, roundPresent bool) error {
 		}
 	case MessageTypeCount:
 		valid = !records && total && !sumID && leaderID && round && count && visited
+	case MessageTypeBarrierInit:
+		for _, field := range []string{"records", "sum_id", "round", "count"} {
+			if _, present := fields[field]; present {
+				return fmt.Errorf("unexpected metadata for inner message type %q: %s", wire.Type, field)
+			}
+		}
+		valid = total && leaderID && visited
 	case MessageTypeFinish:
 		valid = !records && !total && !sumID && leaderID && round && !count && visited
 	default:
@@ -271,11 +290,11 @@ func validateEnvelope(envelope Envelope) error {
 		if envelope.SumID < 0 {
 			return errors.New("sum_id cannot be negative")
 		}
-	case MessageTypeCount, MessageTypeFinish:
+	case MessageTypeCount, MessageTypeFinish, MessageTypeBarrierInit:
 		if envelope.LeaderID < 0 {
 			return errors.New("leader_id cannot be negative")
 		}
-		if envelope.Round == 0 {
+		if envelope.Type != MessageTypeBarrierInit && envelope.Round == 0 {
 			return errors.New("round must be greater than zero")
 		}
 		if envelope.Visited == 0 {

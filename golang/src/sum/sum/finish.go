@@ -1,6 +1,7 @@
 package sum
 
 import (
+	"fmt"
 	"log/slog"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
@@ -98,27 +99,33 @@ func (sum *Sum) publishPartial(key tokenKey, progress *finishRoundProgress) erro
 		sum.mu.Unlock()
 		return nil
 	}
+	if progress.partialSending {
+		sum.mu.Unlock()
+		return fmt.Errorf("PARTIAL already sending for %s", key.clientID)
+	}
+	progress.partialSending = true
 	records := append([]fruititem.FruitItem(nil), progress.records...)
 	sum.mu.Unlock()
 
 	message, err := inner.SerializePartialMessage(key.clientID, sum.id, records)
 	if err != nil {
 		slog.Error("Discarding invalid PARTIAL state", "client_id", key.clientID, "round", key.round, "err", err)
-		return nil
-	}
-	if err := sum.outputExchange.Send(*message); err != nil {
-		return err
+	} else {
+		err = sum.outputExchange.Send(*message)
 	}
 
 	sum.mu.Lock()
 	if current := sum.finishRounds[key]; current == progress {
-		progress.partialPublished = true
-		progress.records = nil
-		delete(sum.fruitItemMap, key.clientID)
-		delete(sum.processedCount, key.clientID)
+		progress.partialSending = false
+		if err == nil {
+			progress.partialPublished = true
+			progress.records = nil
+			delete(sum.fruitItemMap, key.clientID)
+			delete(sum.processedCount, key.clientID)
+		}
 	}
 	sum.mu.Unlock()
-	return nil
+	return err
 }
 
 func (sum *Sum) forwardFinish(key tokenKey, progress *finishRoundProgress) error {
@@ -128,29 +135,35 @@ func (sum *Sum) forwardFinish(key tokenKey, progress *finishRoundProgress) error
 		sum.mu.Unlock()
 		return nil
 	}
+	if progress.forwardSending {
+		sum.mu.Unlock()
+		return fmt.Errorf("FINISH already sending for %s", key.clientID)
+	}
+	progress.forwardSending = true
 	visited := progress.outboundVisited
 	sum.mu.Unlock()
 
 	message, err := inner.SerializeFinishMessage(key.clientID, key.leaderID, key.round, visited)
 	if err != nil {
 		slog.Error("Discarding invalid FINISH state", "client_id", key.clientID, "round", key.round, "err", err)
-		return nil
-	}
-	if err := sum.controlOutput.Send(*message); err != nil {
-		return err
+	} else {
+		err = sum.controlOutput.Send(*message)
 	}
 
 	var cancel countRetryCancel
 	sum.mu.Lock()
 	if current := sum.finishRounds[key]; current == progress {
-		progress.forwarded = true
-		if key.leaderID != sum.id {
-			cancel = sum.removeClientStateLocked(key.clientID)
+		progress.forwardSending = false
+		if err == nil {
+			progress.forwarded = true
+			if key.leaderID != sum.id {
+				cancel = sum.removeClientStateLocked(key.clientID)
+			}
 		}
 	}
 	sum.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
-	return nil
+	return err
 }
