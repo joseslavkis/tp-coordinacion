@@ -67,8 +67,8 @@ func SerializeEOFMessage(clientID string, totalMessages uint64) (*middleware.Mes
 	return serializeEnvelope(Envelope{Type: MessageTypeEOF, ClientID: clientID, TotalMessages: totalMessages})
 }
 
-func SerializePartialMessage(clientID string, sumID int, round uint64, records []fruititem.FruitItem) (*middleware.Message, error) {
-	return serializeEnvelope(Envelope{Type: MessageTypePartial, ClientID: clientID, Records: records, SumID: sumID, Round: round})
+func SerializePartialMessage(clientID string, sumID int, records []fruititem.FruitItem) (*middleware.Message, error) {
+	return serializeEnvelope(Envelope{Type: MessageTypePartial, ClientID: clientID, Records: records, SumID: sumID})
 }
 
 func SerializeResultMessage(clientID string, records []fruititem.FruitItem) (*middleware.Message, error) {
@@ -125,7 +125,6 @@ func serializeEnvelope(envelope Envelope) (*middleware.Message, error) {
 	}
 	if envelope.Type == MessageTypePartial {
 		wire.SumID = &envelope.SumID
-		wire.Round = &envelope.Round
 	}
 
 	body, err := json.Marshal(wire)
@@ -149,7 +148,12 @@ func DeserializeMessage(message *middleware.Message) (Envelope, error) {
 	if err := ensureJSONEnd(decoder); err != nil {
 		return Envelope{}, err
 	}
-	if err := validateWireShape(wire); err != nil {
+	var wireFields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(message.Body), &wireFields); err != nil {
+		return Envelope{}, fmt.Errorf("decode inner envelope fields: %w", err)
+	}
+	_, roundPresent := wireFields["round"]
+	if err := validateWireShape(wire, roundPresent); err != nil {
 		return Envelope{}, err
 	}
 
@@ -192,7 +196,7 @@ func copyMetadata(envelope *Envelope, wire wireEnvelope) {
 	}
 }
 
-func validateWireShape(wire wireEnvelope) error {
+func validateWireShape(wire wireEnvelope, roundPresent bool) error {
 	records := wire.Records != nil
 	total := wire.TotalMessages != nil
 	sumID := wire.SumID != nil
@@ -208,7 +212,11 @@ func validateWireShape(wire wireEnvelope) error {
 	case MessageTypeEOF:
 		valid = !records && total && !sumID && !leaderID && !round && !count && !visited
 	case MessageTypePartial:
-		valid = records && !total && sumID && !leaderID && round && !count && !visited
+		roundSupplied := round || roundPresent
+		valid = records && !total && sumID && !leaderID && !roundSupplied && !count && !visited
+		if !valid && (total || leaderID || roundSupplied || count || visited) {
+			return fmt.Errorf("unexpected metadata for inner message type %q", wire.Type)
+		}
 	case MessageTypeCount:
 		valid = !records && total && !sumID && leaderID && round && count && visited
 	case MessageTypeFinish:
@@ -262,9 +270,6 @@ func validateEnvelope(envelope Envelope) error {
 	case MessageTypePartial:
 		if envelope.SumID < 0 {
 			return errors.New("sum_id cannot be negative")
-		}
-		if envelope.Round == 0 {
-			return errors.New("round must be greater than zero")
 		}
 	case MessageTypeCount, MessageTypeFinish:
 		if envelope.LeaderID < 0 {

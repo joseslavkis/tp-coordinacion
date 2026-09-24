@@ -25,17 +25,12 @@ type AggregationConfig struct {
 	TopSize           int
 }
 
-type aggregationKey struct {
-	clientID string
-	round    uint64
-}
-
 const (
-	completedRoundTTL           = 5 * time.Minute
-	completedRoundSweepInterval = 100
+	completedClientTTL           = 5 * time.Minute
+	completedClientSweepInterval = 100
 )
 
-type aggregationRound struct {
+type aggregationState struct {
 	records          map[string]fruititem.FruitItem
 	receivedPartials map[int]struct{}
 	publishing       bool
@@ -59,9 +54,8 @@ type Aggregation struct {
 	inputExchange       middleware.Middleware
 	topSize             int
 	sumAmount           int
-	rounds              map[aggregationKey]*aggregationRound
-	roundByClient       map[string]uint64
-	completed           map[aggregationKey]time.Time
+	states              map[string]*aggregationState
+	completedClients    map[string]time.Time
 	completedSinceSweep int
 }
 
@@ -84,13 +78,12 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 	}
 
 	return &Aggregation{
-		outputQueue:   outputQueue,
-		inputExchange: inputExchange,
-		topSize:       config.TopSize,
-		sumAmount:     config.SumAmount,
-		rounds:        map[aggregationKey]*aggregationRound{},
-		roundByClient: map[string]uint64{},
-		completed:     map[aggregationKey]time.Time{},
+		outputQueue:      outputQueue,
+		inputExchange:    inputExchange,
+		topSize:          config.TopSize,
+		sumAmount:        config.SumAmount,
+		states:           map[string]*aggregationState{},
+		completedClients: map[string]time.Time{},
 	}, nil
 }
 
@@ -121,11 +114,11 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 	if err != nil {
 		var poison *poisonError
 		if errors.As(err, &poison) {
-			slog.Error("Discarding invalid completion message", "type", envelope.Type, "client_id", envelope.ClientID, "round", envelope.Round, "sum_id", envelope.SumID, "err", err)
+			slog.Error("Discarding invalid completion message", "type", envelope.Type, "client_id", envelope.ClientID, "sum_id", envelope.SumID, "err", err)
 			ack()
 			return
 		}
-		slog.Error("While publishing RESULT", "client_id", envelope.ClientID, "round", envelope.Round, "err", err)
+		slog.Error("While publishing RESULT", "client_id", envelope.ClientID, "err", err)
 		nack()
 		return
 	}
@@ -136,27 +129,27 @@ func (aggregation *Aggregation) handlePartialMessage(envelope inner.Envelope) er
 	if err := aggregation.validateSumID(envelope.SumID); err != nil {
 		return err
 	}
-	key := aggregationKey{clientID: envelope.ClientID, round: envelope.Round}
+	clientID := envelope.ClientID
 	aggregation.mu.Lock()
-	round, completed, err := aggregation.roundForEnvelopeLocked(key)
+	state, completed, err := aggregation.stateForClientLocked(clientID)
 	if err != nil || completed {
 		aggregation.mu.Unlock()
 		return err
 	}
-	if _, duplicate := round.receivedPartials[envelope.SumID]; !duplicate {
+	if _, duplicate := state.receivedPartials[envelope.SumID]; !duplicate {
 		for _, record := range envelope.Records {
-			if current, ok := round.records[record.Fruit]; ok {
-				round.records[record.Fruit] = current.Sum(record)
+			if current, ok := state.records[record.Fruit]; ok {
+				state.records[record.Fruit] = current.Sum(record)
 			} else {
-				round.records[record.Fruit] = record
+				state.records[record.Fruit] = record
 			}
 		}
-		round.receivedPartials[envelope.SumID] = struct{}{}
+		state.receivedPartials[envelope.SumID] = struct{}{}
 	}
-	records, shouldPublish := aggregation.prepareResultLocked(round)
+	records, shouldPublish := aggregation.prepareResultLocked(state)
 	aggregation.mu.Unlock()
 	if shouldPublish {
-		return aggregation.publishResult(key, round, records)
+		return aggregation.publishResult(clientID, state, records)
 	}
 	return nil
 }
@@ -171,78 +164,73 @@ func (aggregation *Aggregation) validateSumID(sumID int) error {
 	return nil
 }
 
-func (aggregation *Aggregation) roundForEnvelopeLocked(key aggregationKey) (*aggregationRound, bool, error) {
-	if completedAt, completed := aggregation.completed[key]; completed {
-		if time.Since(completedAt) < completedRoundTTL {
+func (aggregation *Aggregation) stateForClientLocked(clientID string) (*aggregationState, bool, error) {
+	if completedAt, completed := aggregation.completedClients[clientID]; completed {
+		if time.Since(completedAt) < completedClientTTL {
 			return nil, true, nil
 		}
-		delete(aggregation.completed, key)
+		delete(aggregation.completedClients, clientID)
 	}
-	if activeRound, ok := aggregation.roundByClient[key.clientID]; ok && activeRound != key.round {
-		return nil, false, &poisonError{err: fmt.Errorf("client %q active round is %d, got %d", key.clientID, activeRound, key.round)}
-	}
-	round := aggregation.rounds[key]
-	if round == nil {
-		round = &aggregationRound{
+	state := aggregation.states[clientID]
+	if state == nil {
+		state = &aggregationState{
 			records:          map[string]fruititem.FruitItem{},
 			receivedPartials: map[int]struct{}{},
 		}
-		aggregation.rounds[key] = round
-		aggregation.roundByClient[key.clientID] = key.round
+		aggregation.states[clientID] = state
 	}
-	return round, false, nil
+	return state, false, nil
 }
 
-func (aggregation *Aggregation) prepareResultLocked(round *aggregationRound) ([]fruititem.FruitItem, bool) {
-	if round.publishing || len(round.receivedPartials) != aggregation.sumAmount {
+func (aggregation *Aggregation) prepareResultLocked(state *aggregationState) ([]fruititem.FruitItem, bool) {
+	if state.publishing || len(state.receivedPartials) != aggregation.sumAmount {
 		return nil, false
 	}
-	round.publishing = true
-	return buildFruitTop(round.records, aggregation.topSize), true
+	state.publishing = true
+	return buildFruitTop(state.records, aggregation.topSize), true
 }
 
-func (aggregation *Aggregation) publishResult(key aggregationKey, round *aggregationRound, records []fruititem.FruitItem) error {
-	message, err := inner.SerializeResultMessage(key.clientID, records)
+func (aggregation *Aggregation) publishResult(clientID string, state *aggregationState, records []fruititem.FruitItem) error {
+	message, err := inner.SerializeResultMessage(clientID, records)
 	if err != nil {
 		aggregation.mu.Lock()
-		if aggregation.rounds[key] == round {
-			round.publishing = false
+		if aggregation.states[clientID] == state {
+			state.publishing = false
 		}
 		aggregation.mu.Unlock()
-		slog.Error("Discarding invalid RESULT state", "client_id", key.clientID, "round", key.round, "err", err)
+		slog.Error("Discarding invalid RESULT state", "client_id", clientID, "err", err)
 		return nil
 	}
 	if err := aggregation.outputQueue.Send(*message); err != nil {
 		aggregation.mu.Lock()
-		if aggregation.rounds[key] == round {
-			round.publishing = false
+		if aggregation.states[clientID] == state {
+			state.publishing = false
 		}
 		aggregation.mu.Unlock()
 		return err
 	}
 
 	aggregation.mu.Lock()
-	if aggregation.rounds[key] == round {
-		aggregation.recordCompletedRoundLocked(key)
-		delete(aggregation.rounds, key)
-		delete(aggregation.roundByClient, key.clientID)
+	if aggregation.states[clientID] == state {
+		aggregation.recordCompletedClientLocked(clientID)
+		delete(aggregation.states, clientID)
 	}
 	aggregation.mu.Unlock()
 	return nil
 }
 
-func (aggregation *Aggregation) recordCompletedRoundLocked(key aggregationKey) {
-	aggregation.completed[key] = time.Now()
+func (aggregation *Aggregation) recordCompletedClientLocked(clientID string) {
+	aggregation.completedClients[clientID] = time.Now()
 	aggregation.completedSinceSweep++
-	if aggregation.completedSinceSweep >= completedRoundSweepInterval {
-		aggregation.sweepCompletedRoundsLocked(time.Now())
+	if aggregation.completedSinceSweep >= completedClientSweepInterval {
+		aggregation.sweepCompletedClientsLocked(time.Now())
 	}
 }
 
-func (aggregation *Aggregation) sweepCompletedRoundsLocked(now time.Time) {
-	for key, completedAt := range aggregation.completed {
-		if now.Sub(completedAt) >= completedRoundTTL {
-			delete(aggregation.completed, key)
+func (aggregation *Aggregation) sweepCompletedClientsLocked(now time.Time) {
+	for clientID, completedAt := range aggregation.completedClients {
+		if now.Sub(completedAt) >= completedClientTTL {
+			delete(aggregation.completedClients, clientID)
 		}
 	}
 	aggregation.completedSinceSweep = 0

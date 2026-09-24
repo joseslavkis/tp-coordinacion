@@ -101,7 +101,7 @@ func (sum *Sum) publishPartial(key tokenKey, progress *finishRoundProgress) erro
 	records := append([]fruititem.FruitItem(nil), progress.records...)
 	sum.mu.Unlock()
 
-	message, err := inner.SerializePartialMessage(key.clientID, sum.id, key.round, records)
+	message, err := inner.SerializePartialMessage(key.clientID, sum.id, records)
 	if err != nil {
 		slog.Error("Discarding invalid PARTIAL state", "client_id", key.clientID, "round", key.round, "err", err)
 		return nil
