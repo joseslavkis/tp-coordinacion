@@ -84,9 +84,6 @@ func (sum *Sum) completeFinish(key tokenKey, progress *finishRoundProgress) erro
 	if err := sum.publishPartial(key, progress); err != nil {
 		return err
 	}
-	if err := sum.publishSumDone(key, progress); err != nil {
-		return err
-	}
 	return sum.forwardFinish(key, progress)
 }
 
@@ -117,36 +114,6 @@ func (sum *Sum) publishPartial(key tokenKey, progress *finishRoundProgress) erro
 	if current := sum.finishRounds[key]; current == progress {
 		progress.partialPublished = true
 		progress.records = nil
-	}
-	sum.mu.Unlock()
-	return nil
-}
-
-func (sum *Sum) publishSumDone(key tokenKey, progress *finishRoundProgress) error {
-	sum.mu.Lock()
-	current := sum.finishRounds[key]
-	if current != progress {
-		sum.mu.Unlock()
-		return nil
-	}
-	if progress.donePublished {
-		sum.mu.Unlock()
-		return nil
-	}
-	sum.mu.Unlock()
-
-	message, err := inner.SerializeSumDoneMessage(key.clientID, sum.id, key.round)
-	if err != nil {
-		slog.Error("Discarding invalid SUM_DONE state", "client_id", key.clientID, "round", key.round, "err", err)
-		return nil
-	}
-	if err := sum.outputExchange.Send(*message); err != nil {
-		return err
-	}
-
-	sum.mu.Lock()
-	if current := sum.finishRounds[key]; current == progress {
-		progress.donePublished = true
 		delete(sum.fruitItemMap, key.clientID)
 		delete(sum.processedCount, key.clientID)
 	}

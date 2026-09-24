@@ -18,7 +18,6 @@ const (
 	MessageTypeData    MessageType = "data"
 	MessageTypeEOF     MessageType = "eof"
 	MessageTypePartial MessageType = "partial"
-	MessageTypeSumDone MessageType = "sum_done"
 	MessageTypeResult  MessageType = "result"
 	MessageTypeCount   MessageType = "count"
 	MessageTypeFinish  MessageType = "finish"
@@ -72,10 +71,6 @@ func SerializePartialMessage(clientID string, sumID int, round uint64, records [
 	return serializeEnvelope(Envelope{Type: MessageTypePartial, ClientID: clientID, Records: records, SumID: sumID, Round: round})
 }
 
-func SerializeSumDoneMessage(clientID string, sumID int, round uint64) (*middleware.Message, error) {
-	return serializeEnvelope(Envelope{Type: MessageTypeSumDone, ClientID: clientID, SumID: sumID, Round: round})
-}
-
 func SerializeResultMessage(clientID string, records []fruititem.FruitItem) (*middleware.Message, error) {
 	return serializeEnvelope(Envelope{Type: MessageTypeResult, ClientID: clientID, Records: records})
 }
@@ -117,9 +112,6 @@ func serializeEnvelope(envelope Envelope) (*middleware.Message, error) {
 		wire.Records = &records
 	case MessageTypeEOF:
 		wire.TotalMessages = &envelope.TotalMessages
-	case MessageTypeSumDone:
-		wire.SumID = &envelope.SumID
-		wire.Round = &envelope.Round
 	case MessageTypeCount:
 		wire.LeaderID = &envelope.LeaderID
 		wire.Round = &envelope.Round
@@ -217,8 +209,6 @@ func validateWireShape(wire wireEnvelope) error {
 		valid = !records && total && !sumID && !leaderID && !round && !count && !visited
 	case MessageTypePartial:
 		valid = records && !total && sumID && !leaderID && round && !count && !visited
-	case MessageTypeSumDone:
-		valid = !records && !total && sumID && !leaderID && round && !count && !visited
 	case MessageTypeCount:
 		valid = !records && total && !sumID && leaderID && round && count && visited
 	case MessageTypeFinish:
@@ -269,7 +259,7 @@ func validateEnvelope(envelope Envelope) error {
 			return errors.New("data envelope requires at least one record")
 		}
 	case MessageTypeEOF, MessageTypeResult:
-	case MessageTypePartial, MessageTypeSumDone:
+	case MessageTypePartial:
 		if envelope.SumID < 0 {
 			return errors.New("sum_id cannot be negative")
 		}
