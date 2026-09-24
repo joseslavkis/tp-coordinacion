@@ -38,7 +38,6 @@ const (
 type aggregationRound struct {
 	records          map[string]fruititem.FruitItem
 	receivedPartials map[int]struct{}
-	done             map[int]struct{}
 	publishing       bool
 }
 
@@ -114,8 +113,6 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 	switch envelope.Type {
 	case inner.MessageTypePartial:
 		err = aggregation.handlePartialMessage(envelope)
-	case inner.MessageTypeSumDone:
-		err = aggregation.handleSumDoneMessage(envelope)
 	default:
 		slog.Error("Discarding unexpected Aggregation message", "type", envelope.Type)
 		ack()
@@ -164,26 +161,6 @@ func (aggregation *Aggregation) handlePartialMessage(envelope inner.Envelope) er
 	return nil
 }
 
-func (aggregation *Aggregation) handleSumDoneMessage(envelope inner.Envelope) error {
-	if err := aggregation.validateSumID(envelope.SumID); err != nil {
-		return err
-	}
-	key := aggregationKey{clientID: envelope.ClientID, round: envelope.Round}
-	aggregation.mu.Lock()
-	round, completed, err := aggregation.roundForEnvelopeLocked(key)
-	if err != nil || completed {
-		aggregation.mu.Unlock()
-		return err
-	}
-	round.done[envelope.SumID] = struct{}{}
-	records, shouldPublish := aggregation.prepareResultLocked(round)
-	aggregation.mu.Unlock()
-	if shouldPublish {
-		return aggregation.publishResult(key, round, records)
-	}
-	return nil
-}
-
 func (aggregation *Aggregation) validateSumID(sumID int) error {
 	if aggregation.sumAmount <= 0 {
 		return &poisonError{err: errors.New("aggregation sum amount must be greater than zero")}
@@ -209,7 +186,6 @@ func (aggregation *Aggregation) roundForEnvelopeLocked(key aggregationKey) (*agg
 		round = &aggregationRound{
 			records:          map[string]fruititem.FruitItem{},
 			receivedPartials: map[int]struct{}{},
-			done:             map[int]struct{}{},
 		}
 		aggregation.rounds[key] = round
 		aggregation.roundByClient[key.clientID] = key.round
@@ -218,7 +194,7 @@ func (aggregation *Aggregation) roundForEnvelopeLocked(key aggregationKey) (*agg
 }
 
 func (aggregation *Aggregation) prepareResultLocked(round *aggregationRound) ([]fruititem.FruitItem, bool) {
-	if round.publishing || len(round.receivedPartials) != aggregation.sumAmount || len(round.done) != aggregation.sumAmount {
+	if round.publishing || len(round.receivedPartials) != aggregation.sumAmount {
 		return nil, false
 	}
 	round.publishing = true
