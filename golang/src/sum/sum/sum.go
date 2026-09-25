@@ -53,6 +53,9 @@ func NewSum(config SumConfig) (*Sum, error) {
 	if config.SumPrefix == "" {
 		return nil, errors.New("sum prefix is required")
 	}
+	if config.AggregationAmount <= 0 {
+		return nil, errors.New("aggregation amount must be greater than zero")
+	}
 
 	connSettings := middleware.ConnSettings{Hostname: config.MomHost, Port: config.MomPort}
 	inputQueue, err := middleware.CreateQueueMiddleware(config.InputQueue, connSettings)
