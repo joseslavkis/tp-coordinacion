@@ -1,8 +1,11 @@
 package sum
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
+	"time"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -21,15 +24,37 @@ type SumConfig struct {
 }
 
 type Sum struct {
-	inputQueue     middleware.Middleware
-	outputExchange middleware.Middleware
-	fruitItemMap   map[string]map[string]fruititem.FruitItem
-	dataPublished  map[string]bool
+	mu                  sync.Mutex
+	inputQueue          middleware.Middleware
+	outputExchange      middleware.Middleware
+	controlInput        middleware.Middleware
+	controlOutput       middleware.Middleware
+	id                  int
+	sumAmount           int
+	fruitItemMap        map[string]map[string]fruititem.FruitItem
+	processedCount      map[string]uint64
+	barriers            map[string]*clientBarrierState
+	initForwards        map[initForwardKey]*initForwardProgress
+	countRounds         map[tokenKey]*countRoundProgress
+	finishRounds        map[tokenKey]*finishRoundProgress
+	completedClients    map[string]time.Time
+	completedSinceSweep int
+	countRetryDelay     countRetryDelayFunc
+	countRetryTimer     countRetryScheduler
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
-	connSettings := middleware.ConnSettings{Hostname: config.MomHost, Port: config.MomPort}
+	if config.SumAmount <= 0 {
+		return nil, errors.New("sum amount must be greater than zero")
+	}
+	if config.Id < 0 || config.Id >= config.SumAmount {
+		return nil, fmt.Errorf("sum id %d is outside [0, %d)", config.Id, config.SumAmount)
+	}
+	if config.SumPrefix == "" {
+		return nil, errors.New("sum prefix is required")
+	}
 
+	connSettings := middleware.ConnSettings{Hostname: config.MomHost, Port: config.MomPort}
 	inputQueue, err := middleware.CreateQueueMiddleware(config.InputQueue, connSettings)
 	if err != nil {
 		return nil, err
@@ -39,32 +64,67 @@ func NewSum(config SumConfig) (*Sum, error) {
 	for i := range config.AggregationAmount {
 		outputExchangeRouteKeys[i] = fmt.Sprintf("%s_%d", config.AggregationPrefix, i)
 	}
-
 	outputExchange, err := middleware.CreateExchangeMiddleware(config.AggregationPrefix, outputExchangeRouteKeys, connSettings)
 	if err != nil {
 		inputQueue.Close()
 		return nil, err
 	}
 
+	controlInput, err := middleware.CreateQueueMiddleware(controlQueueName(config.SumPrefix, config.Id), connSettings)
+	if err != nil {
+		inputQueue.Close()
+		outputExchange.Close()
+		return nil, err
+	}
+	controlOutput, err := middleware.CreateQueueMiddleware(controlQueueName(config.SumPrefix, successorID(config.Id, config.SumAmount)), connSettings)
+	if err != nil {
+		inputQueue.Close()
+		outputExchange.Close()
+		controlInput.Close()
+		return nil, err
+	}
+
 	return &Sum{
-		inputQueue:     inputQueue,
-		outputExchange: outputExchange,
-		fruitItemMap:   map[string]map[string]fruititem.FruitItem{},
-		dataPublished:  map[string]bool{},
+		inputQueue:       inputQueue,
+		outputExchange:   outputExchange,
+		controlInput:     controlInput,
+		controlOutput:    controlOutput,
+		id:               config.Id,
+		sumAmount:        config.SumAmount,
+		fruitItemMap:     map[string]map[string]fruititem.FruitItem{},
+		processedCount:   map[string]uint64{},
+		barriers:         map[string]*clientBarrierState{},
+		initForwards:     map[initForwardKey]*initForwardProgress{},
+		countRounds:      map[tokenKey]*countRoundProgress{},
+		finishRounds:     map[tokenKey]*finishRoundProgress{},
+		completedClients: map[string]time.Time{},
+		countRetryDelay:  defaultCountRetryDelay,
+		countRetryTimer:  defaultCountRetryScheduler,
 	}, nil
 }
 
 func (sum *Sum) Run() {
-	sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+	if sum.controlInput != nil {
+		go func() {
+			if err := sum.controlInput.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+				sum.handleControlMessage(msg, ack, nack)
+			}); err != nil {
+				slog.Error("While consuming Sum control queue", "err", err)
+			}
+		}()
+	}
+	if err := sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		sum.handleMessage(msg, ack, nack)
-	})
+	}); err != nil {
+		slog.Error("While consuming Sum input queue", "err", err)
+	}
 }
 
 func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	envelope, err := inner.DeserializeMessage(&msg)
 	if err != nil {
-		slog.Error("While deserializing message", "err", err)
-		nack()
+		slog.Error("Discarding malformed Sum working-queue message", "err", err)
+		ack()
 		return
 	}
 
@@ -72,68 +132,61 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	case inner.MessageTypeData:
 		sum.handleDataMessage(envelope.ClientID, envelope.Records)
 	case inner.MessageTypeEOF:
-		if err := sum.handleEndOfRecordMessage(envelope.ClientID); err != nil {
-			slog.Error("While handling end of record message", "err", err)
-			nack()
-			return
-		}
+		err = sum.handleEndOfRecordMessage(envelope.ClientID, envelope.TotalMessages)
 	default:
-		slog.Error("Unexpected message type", "type", envelope.Type)
+		slog.Error("Discarding unexpected Sum working-queue message", "type", envelope.Type)
+		ack()
+		return
+	}
+	if err != nil {
+		slog.Error("While forwarding Sum working-queue completion message", "type", envelope.Type, "client_id", envelope.ClientID, "err", err)
 		nack()
 		return
 	}
 	ack()
 }
 
-func (sum *Sum) handleEndOfRecordMessage(clientID string) error {
-	slog.Info("Received End Of Records message", "client_id", clientID)
-	clientRecords := sum.fruitItemMap[clientID]
-	if len(clientRecords) > 0 && !sum.dataPublished[clientID] {
-		fruitRecords := make([]fruititem.FruitItem, 0, len(clientRecords))
-		for _, fruitRecord := range clientRecords {
-			fruitRecords = append(fruitRecords, fruitRecord)
-		}
-		message, err := inner.SerializeMessage(inner.MessageTypeData, clientID, fruitRecords)
-		if err != nil {
-			slog.Debug("While serializing message", "err", err)
-			return err
-		}
-		if err := sum.outputExchange.Send(*message); err != nil {
-			slog.Debug("While sending message", "err", err)
-			return err
-		}
-		if sum.dataPublished == nil {
-			sum.dataPublished = map[string]bool{}
-		}
-		sum.dataPublished[clientID] = true
+func (sum *Sum) handleEndOfRecordMessage(clientID string, totalMessages uint64) error {
+	sum.mu.Lock()
+	if sum.hasFinishedClientLocked(clientID) {
+		sum.mu.Unlock()
+		slog.Error("Discarding late EOF for completed client", "client_id", clientID)
+		return nil
 	}
-
-	message, err := inner.SerializeMessage(inner.MessageTypeEOF, clientID, []fruititem.FruitItem{})
-	if err != nil {
-		slog.Debug("While serializing EOF message", "err", err)
-		return err
+	sum.mu.Unlock()
+	leaderID := leaderForClient(clientID, sum.sumAmount)
+	if leaderID == sum.id {
+		return sum.initializeBarrier(clientID, totalMessages)
 	}
-	if err := sum.outputExchange.Send(*message); err != nil {
-		slog.Debug("While sending EOF message", "err", err)
-		return err
-	}
-	delete(sum.fruitItemMap, clientID)
-	delete(sum.dataPublished, clientID)
-	return nil
+	return sum.forwardBarrierInit(clientID, leaderID, totalMessages, 1)
 }
 
 func (sum *Sum) handleDataMessage(clientID string, fruitRecords []fruititem.FruitItem) {
+	sum.mu.Lock()
+	defer sum.mu.Unlock()
+	if sum.hasFinishedClientLocked(clientID) {
+		slog.Error("Discarding late DATA for completed client", "client_id", clientID)
+		return
+	}
 	clientRecords, ok := sum.fruitItemMap[clientID]
 	if !ok {
 		clientRecords = map[string]fruititem.FruitItem{}
 		sum.fruitItemMap[clientID] = clientRecords
 	}
 	for _, fruitRecord := range fruitRecords {
-		current, ok := clientRecords[fruitRecord.Fruit]
-		if ok {
+		if current, ok := clientRecords[fruitRecord.Fruit]; ok {
 			clientRecords[fruitRecord.Fruit] = current.Sum(fruitRecord)
 		} else {
 			clientRecords[fruitRecord.Fruit] = fruitRecord
 		}
 	}
+	sum.processedCount[clientID]++
+}
+
+func copyFruitRecords(records map[string]fruititem.FruitItem) []fruititem.FruitItem {
+	result := make([]fruititem.FruitItem, 0, len(records))
+	for _, record := range records {
+		result = append(result, record)
+	}
+	return result
 }
