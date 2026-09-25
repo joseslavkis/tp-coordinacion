@@ -66,12 +66,17 @@ type initForwardProgress struct {
 }
 
 type finishRoundProgress struct {
-	records          []fruititem.FruitItem
+	partials         []partialProgress
 	outboundVisited  uint64
 	partialPublished bool
-	partialSending   bool
 	forwarded        bool
 	forwardSending   bool
+}
+
+type partialProgress struct {
+	records   []fruititem.FruitItem
+	published bool
+	sending   bool
 }
 
 func controlQueueName(prefix string, id int) string {

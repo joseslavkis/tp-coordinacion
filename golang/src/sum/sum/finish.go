@@ -18,10 +18,7 @@ func (sum *Sum) onCountBarrierPassed(key tokenKey) error {
 	progress := sum.finishRounds[key]
 	if !barrier.finishStarted {
 		barrier.finishStarted = true
-		progress = &finishRoundProgress{
-			records:         copyFruitRecords(sum.fruitItemMap[key.clientID]),
-			outboundVisited: 1,
-		}
+		progress = sum.newFinishProgressLocked(key.clientID, 1)
 		sum.finishRounds[key] = progress
 	}
 	sum.mu.Unlock()
@@ -71,57 +68,91 @@ func (sum *Sum) handleFinishToken(envelope inner.Envelope) error {
 			return nil
 		}
 	} else {
-		progress = &finishRoundProgress{
-			records:         copyFruitRecords(sum.fruitItemMap[envelope.ClientID]),
-			outboundVisited: envelope.Visited + 1,
-		}
+		progress = sum.newFinishProgressLocked(envelope.ClientID, envelope.Visited+1)
 		sum.finishRounds[key] = progress
 	}
 	sum.mu.Unlock()
 	return sum.completeFinish(key, progress)
 }
 
+func (sum *Sum) newFinishProgressLocked(clientID string, visited uint64) *finishRoundProgress {
+	progress := &finishRoundProgress{
+		partials:        make([]partialProgress, sum.aggregationAmount),
+		outboundVisited: visited,
+	}
+	for _, record := range copyFruitRecords(sum.fruitItemMap[clientID]) {
+		aggregationID := aggregationFor(clientID, record.Fruit, sum.aggregationAmount)
+		progress.partials[aggregationID].records = append(progress.partials[aggregationID].records, record)
+	}
+	return progress
+}
+
 func (sum *Sum) completeFinish(key tokenKey, progress *finishRoundProgress) error {
-	if err := sum.publishPartial(key, progress); err != nil {
+	if err := sum.publishPartials(key, progress); err != nil {
 		return err
 	}
 	return sum.forwardFinish(key, progress)
 }
 
-func (sum *Sum) publishPartial(key tokenKey, progress *finishRoundProgress) error {
+func (sum *Sum) publishPartials(key tokenKey, progress *finishRoundProgress) error {
+	if len(progress.partials) != sum.aggregationAmount || sum.aggregationAmount <= 0 {
+		return fmt.Errorf("invalid PARTIAL shard count for %s", key.clientID)
+	}
+	for aggregationID := range progress.partials {
+		if err := sum.publishPartialTo(key, progress, aggregationID); err != nil {
+			return err
+		}
+	}
+
+	sum.mu.Lock()
+	defer sum.mu.Unlock()
+	if sum.finishRounds[key] != progress || progress.partialPublished {
+		return nil
+	}
+	for _, partial := range progress.partials {
+		if !partial.published {
+			return fmt.Errorf("PARTIAL still sending for %s", key.clientID)
+		}
+	}
+	delete(sum.fruitItemMap, key.clientID)
+	delete(sum.processedCount, key.clientID)
+	progress.partialPublished = true
+	return nil
+}
+
+func (sum *Sum) publishPartialTo(key tokenKey, progress *finishRoundProgress, aggregationID int) error {
 	sum.mu.Lock()
 	current := sum.finishRounds[key]
 	if current != progress {
 		sum.mu.Unlock()
 		return nil
 	}
-	if progress.partialPublished {
+	partial := &progress.partials[aggregationID]
+	if partial.published {
 		sum.mu.Unlock()
 		return nil
 	}
-	if progress.partialSending {
+	if partial.sending {
 		sum.mu.Unlock()
-		return fmt.Errorf("PARTIAL already sending for %s", key.clientID)
+		return fmt.Errorf("PARTIAL already sending for %s to aggregation %d", key.clientID, aggregationID)
 	}
-	progress.partialSending = true
-	records := append([]fruititem.FruitItem(nil), progress.records...)
+	partial.sending = true
+	records := append([]fruititem.FruitItem(nil), partial.records...)
 	sum.mu.Unlock()
 
 	message, err := inner.SerializePartialMessage(key.clientID, sum.id, records)
 	if err != nil {
 		slog.Error("Discarding invalid PARTIAL state", "client_id", key.clientID, "round", key.round, "err", err)
 	} else {
-		err = sum.outputExchange.Send(*message)
+		err = sum.outputExchange.SendTo(fmt.Sprintf("%s_%d", sum.aggregationPrefix, aggregationID), *message)
 	}
 
 	sum.mu.Lock()
 	if current := sum.finishRounds[key]; current == progress {
-		progress.partialSending = false
+		partial.sending = false
 		if err == nil {
-			progress.partialPublished = true
-			progress.records = nil
-			delete(sum.fruitItemMap, key.clientID)
-			delete(sum.processedCount, key.clientID)
+			partial.published = true
+			partial.records = nil
 		}
 	}
 	sum.mu.Unlock()
