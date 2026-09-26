@@ -26,11 +26,13 @@ type SumConfig struct {
 type Sum struct {
 	mu                  sync.Mutex
 	inputQueue          middleware.Middleware
-	outputExchange      middleware.Middleware
+	outputExchange      middleware.RoutedMiddleware
 	controlInput        middleware.Middleware
 	controlOutput       middleware.Middleware
 	id                  int
 	sumAmount           int
+	aggregationAmount   int
+	aggregationPrefix   string
 	fruitItemMap        map[string]map[string]fruititem.FruitItem
 	processedCount      map[string]uint64
 	barriers            map[string]*clientBarrierState
@@ -53,6 +55,9 @@ func NewSum(config SumConfig) (*Sum, error) {
 	if config.SumPrefix == "" {
 		return nil, errors.New("sum prefix is required")
 	}
+	if config.AggregationAmount <= 0 {
+		return nil, errors.New("aggregation amount must be greater than zero")
+	}
 
 	connSettings := middleware.ConnSettings{Hostname: config.MomHost, Port: config.MomPort}
 	inputQueue, err := middleware.CreateQueueMiddleware(config.InputQueue, connSettings)
@@ -68,6 +73,12 @@ func NewSum(config SumConfig) (*Sum, error) {
 	if err != nil {
 		inputQueue.Close()
 		return nil, err
+	}
+	routedExchange, ok := outputExchange.(middleware.RoutedMiddleware)
+	if !ok {
+		outputExchange.Close()
+		inputQueue.Close()
+		return nil, errors.New("sum output exchange does not support routed publishing")
 	}
 
 	controlInput, err := middleware.CreateQueueMiddleware(controlQueueName(config.SumPrefix, config.Id), connSettings)
@@ -85,21 +96,23 @@ func NewSum(config SumConfig) (*Sum, error) {
 	}
 
 	return &Sum{
-		inputQueue:       inputQueue,
-		outputExchange:   outputExchange,
-		controlInput:     controlInput,
-		controlOutput:    controlOutput,
-		id:               config.Id,
-		sumAmount:        config.SumAmount,
-		fruitItemMap:     map[string]map[string]fruititem.FruitItem{},
-		processedCount:   map[string]uint64{},
-		barriers:         map[string]*clientBarrierState{},
-		initForwards:     map[initForwardKey]*initForwardProgress{},
-		countRounds:      map[tokenKey]*countRoundProgress{},
-		finishRounds:     map[tokenKey]*finishRoundProgress{},
-		completedClients: map[string]time.Time{},
-		countRetryDelay:  defaultCountRetryDelay,
-		countRetryTimer:  defaultCountRetryScheduler,
+		inputQueue:        inputQueue,
+		outputExchange:    routedExchange,
+		controlInput:      controlInput,
+		controlOutput:     controlOutput,
+		id:                config.Id,
+		sumAmount:         config.SumAmount,
+		aggregationAmount: config.AggregationAmount,
+		aggregationPrefix: config.AggregationPrefix,
+		fruitItemMap:      map[string]map[string]fruititem.FruitItem{},
+		processedCount:    map[string]uint64{},
+		barriers:          map[string]*clientBarrierState{},
+		initForwards:      map[initForwardKey]*initForwardProgress{},
+		countRounds:       map[tokenKey]*countRoundProgress{},
+		finishRounds:      map[tokenKey]*finishRoundProgress{},
+		completedClients:  map[string]time.Time{},
+		countRetryDelay:   defaultCountRetryDelay,
+		countRetryTimer:   defaultCountRetryScheduler,
 	}, nil
 }
 

@@ -54,6 +54,7 @@ type Aggregation struct {
 	inputExchange       middleware.Middleware
 	topSize             int
 	sumAmount           int
+	id                  int
 	states              map[string]*aggregationState
 	completedClients    map[string]time.Time
 	completedSinceSweep int
@@ -62,6 +63,15 @@ type Aggregation struct {
 func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 	if config.SumAmount <= 0 {
 		return nil, errors.New("sum amount must be greater than zero")
+	}
+	if config.AggregationAmount <= 0 {
+		return nil, errors.New("aggregation amount must be greater than zero")
+	}
+	if config.Id < 0 || config.Id >= config.AggregationAmount {
+		return nil, fmt.Errorf("aggregation id %d is outside [0, %d)", config.Id, config.AggregationAmount)
+	}
+	if config.TopSize <= 0 {
+		return nil, errors.New("top size must be greater than zero")
 	}
 	connSettings := middleware.ConnSettings{Hostname: config.MomHost, Port: config.MomPort}
 
@@ -82,6 +92,7 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 		inputExchange:    inputExchange,
 		topSize:          config.TopSize,
 		sumAmount:        config.SumAmount,
+		id:               config.Id,
 		states:           map[string]*aggregationState{},
 		completedClients: map[string]time.Time{},
 	}, nil
@@ -118,7 +129,7 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 			ack()
 			return
 		}
-		slog.Error("While publishing RESULT", "client_id", envelope.ClientID, "err", err)
+		slog.Error("While publishing TOP_PARTIAL", "client_id", envelope.ClientID, "err", err)
 		nack()
 		return
 	}
@@ -146,10 +157,10 @@ func (aggregation *Aggregation) handlePartialMessage(envelope inner.Envelope) er
 		}
 		state.receivedPartials[envelope.SumID] = struct{}{}
 	}
-	records, shouldPublish := aggregation.prepareResultLocked(state)
+	records, shouldPublish := aggregation.prepareTopPartialLocked(state)
 	aggregation.mu.Unlock()
 	if shouldPublish {
-		return aggregation.publishResult(clientID, state, records)
+		return aggregation.publishTopPartial(clientID, state, records)
 	}
 	return nil
 }
@@ -182,7 +193,7 @@ func (aggregation *Aggregation) stateForClientLocked(clientID string) (*aggregat
 	return state, false, nil
 }
 
-func (aggregation *Aggregation) prepareResultLocked(state *aggregationState) ([]fruititem.FruitItem, bool) {
+func (aggregation *Aggregation) prepareTopPartialLocked(state *aggregationState) ([]fruititem.FruitItem, bool) {
 	if state.publishing || len(state.receivedPartials) != aggregation.sumAmount {
 		return nil, false
 	}
@@ -190,15 +201,15 @@ func (aggregation *Aggregation) prepareResultLocked(state *aggregationState) ([]
 	return buildFruitTop(state.records, aggregation.topSize), true
 }
 
-func (aggregation *Aggregation) publishResult(clientID string, state *aggregationState, records []fruititem.FruitItem) error {
-	message, err := inner.SerializeResultMessage(clientID, records)
+func (aggregation *Aggregation) publishTopPartial(clientID string, state *aggregationState, records []fruititem.FruitItem) error {
+	message, err := inner.SerializeTopPartialMessage(clientID, aggregation.id, records)
 	if err != nil {
 		aggregation.mu.Lock()
 		if aggregation.states[clientID] == state {
 			state.publishing = false
 		}
 		aggregation.mu.Unlock()
-		slog.Error("Discarding invalid RESULT state", "client_id", clientID, "err", err)
+		slog.Error("Discarding invalid TOP_PARTIAL state", "client_id", clientID, "err", err)
 		return nil
 	}
 	if err := aggregation.outputQueue.Send(*message); err != nil {
