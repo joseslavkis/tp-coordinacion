@@ -18,6 +18,7 @@ const (
 	MessageTypeData        MessageType = "data"
 	MessageTypeEOF         MessageType = "eof"
 	MessageTypePartial     MessageType = "partial"
+	MessageTypeTopPartial  MessageType = "top_partial"
 	MessageTypeResult      MessageType = "result"
 	MessageTypeCount       MessageType = "count"
 	MessageTypeFinish      MessageType = "finish"
@@ -30,6 +31,7 @@ type Envelope struct {
 	Records       []fruititem.FruitItem
 	TotalMessages uint64
 	SumID         int
+	AggregationID int
 	LeaderID      int
 	Round         uint64
 	Count         uint64
@@ -42,6 +44,7 @@ type wireEnvelope struct {
 	Records       *[]json.RawMessage `json:"records,omitempty"`
 	TotalMessages *uint64            `json:"total_messages,omitempty"`
 	SumID         *int               `json:"sum_id,omitempty"`
+	AggregationID *int               `json:"aggregation_id,omitempty"`
 	LeaderID      *int               `json:"leader_id,omitempty"`
 	Round         *uint64            `json:"round,omitempty"`
 	Count         *uint64            `json:"count,omitempty"`
@@ -54,6 +57,7 @@ type serializableEnvelope struct {
 	Records       *[][2]interface{} `json:"records,omitempty"`
 	TotalMessages *uint64           `json:"total_messages,omitempty"`
 	SumID         *int              `json:"sum_id,omitempty"`
+	AggregationID *int              `json:"aggregation_id,omitempty"`
 	LeaderID      *int              `json:"leader_id,omitempty"`
 	Round         *uint64           `json:"round,omitempty"`
 	Count         *uint64           `json:"count,omitempty"`
@@ -70,6 +74,10 @@ func SerializeEOFMessage(clientID string, totalMessages uint64) (*middleware.Mes
 
 func SerializePartialMessage(clientID string, sumID int, records []fruititem.FruitItem) (*middleware.Message, error) {
 	return serializeEnvelope(Envelope{Type: MessageTypePartial, ClientID: clientID, Records: records, SumID: sumID})
+}
+
+func SerializeTopPartialMessage(clientID string, aggregationID int, records []fruititem.FruitItem) (*middleware.Message, error) {
+	return serializeEnvelope(Envelope{Type: MessageTypeTopPartial, ClientID: clientID, Records: records, AggregationID: aggregationID})
 }
 
 func SerializeResultMessage(clientID string, records []fruititem.FruitItem) (*middleware.Message, error) {
@@ -112,7 +120,7 @@ func serializeEnvelope(envelope Envelope) (*middleware.Message, error) {
 
 	wire := serializableEnvelope{Type: envelope.Type, ClientID: envelope.ClientID}
 	switch envelope.Type {
-	case MessageTypeData, MessageTypePartial, MessageTypeResult:
+	case MessageTypeData, MessageTypePartial, MessageTypeTopPartial, MessageTypeResult:
 		records := make([][2]interface{}, 0, len(envelope.Records))
 		for _, record := range envelope.Records {
 			records = append(records, [2]interface{}{record.Fruit, record.Amount})
@@ -137,6 +145,9 @@ func serializeEnvelope(envelope Envelope) (*middleware.Message, error) {
 	}
 	if envelope.Type == MessageTypePartial {
 		wire.SumID = &envelope.SumID
+	}
+	if envelope.Type == MessageTypeTopPartial {
+		wire.AggregationID = &envelope.AggregationID
 	}
 
 	body, err := json.Marshal(wire)
@@ -193,6 +204,9 @@ func copyMetadata(envelope *Envelope, wire wireEnvelope) {
 	if wire.SumID != nil {
 		envelope.SumID = *wire.SumID
 	}
+	if wire.AggregationID != nil {
+		envelope.AggregationID = *wire.AggregationID
+	}
 	if wire.LeaderID != nil {
 		envelope.LeaderID = *wire.LeaderID
 	}
@@ -208,10 +222,14 @@ func copyMetadata(envelope *Envelope, wire wireEnvelope) {
 }
 
 func validateWireShape(wire wireEnvelope, fields map[string]json.RawMessage) error {
+	if _, present := fields["aggregation_id"]; present && wire.Type != MessageTypeTopPartial {
+		return fmt.Errorf("unexpected metadata for inner message type %q: aggregation_id", wire.Type)
+	}
 	_, roundPresent := fields["round"]
 	records := wire.Records != nil
 	total := wire.TotalMessages != nil
 	sumID := wire.SumID != nil
+	aggregationID := wire.AggregationID != nil
 	leaderID := wire.LeaderID != nil
 	round := wire.Round != nil
 	count := wire.Count != nil
@@ -220,26 +238,33 @@ func validateWireShape(wire wireEnvelope, fields map[string]json.RawMessage) err
 	valid := false
 	switch wire.Type {
 	case MessageTypeData, MessageTypeResult:
-		valid = records && !total && !sumID && !leaderID && !round && !count && !visited
+		valid = records && !total && !sumID && !aggregationID && !leaderID && !round && !count && !visited
 	case MessageTypeEOF:
-		valid = !records && total && !sumID && !leaderID && !round && !count && !visited
+		valid = !records && total && !sumID && !aggregationID && !leaderID && !round && !count && !visited
 	case MessageTypePartial:
 		roundSupplied := round || roundPresent
-		valid = records && !total && sumID && !leaderID && !roundSupplied && !count && !visited
+		valid = records && !total && sumID && !aggregationID && !leaderID && !roundSupplied && !count && !visited
 		if !valid && (total || leaderID || roundSupplied || count || visited) {
 			return fmt.Errorf("unexpected metadata for inner message type %q", wire.Type)
 		}
+	case MessageTypeTopPartial:
+		for _, field := range []string{"sum_id", "leader_id", "round", "total_messages", "count", "visited"} {
+			if _, present := fields[field]; present {
+				return fmt.Errorf("unexpected metadata for inner message type %q: %s", wire.Type, field)
+			}
+		}
+		valid = records && aggregationID
 	case MessageTypeCount:
-		valid = !records && total && !sumID && leaderID && round && count && visited
+		valid = !records && total && !sumID && !aggregationID && leaderID && round && count && visited
 	case MessageTypeBarrierInit:
-		for _, field := range []string{"records", "sum_id", "round", "count"} {
+		for _, field := range []string{"records", "sum_id", "aggregation_id", "round", "count"} {
 			if _, present := fields[field]; present {
 				return fmt.Errorf("unexpected metadata for inner message type %q: %s", wire.Type, field)
 			}
 		}
 		valid = total && leaderID && visited
 	case MessageTypeFinish:
-		valid = !records && !total && !sumID && leaderID && round && !count && visited
+		valid = !records && !total && !sumID && !aggregationID && leaderID && round && !count && visited
 	default:
 		return fmt.Errorf("unknown inner message type %q", wire.Type)
 	}
@@ -289,6 +314,10 @@ func validateEnvelope(envelope Envelope) error {
 	case MessageTypePartial:
 		if envelope.SumID < 0 {
 			return errors.New("sum_id cannot be negative")
+		}
+	case MessageTypeTopPartial:
+		if envelope.AggregationID < 0 {
+			return errors.New("aggregation_id cannot be negative")
 		}
 	case MessageTypeCount, MessageTypeFinish, MessageTypeBarrierInit:
 		if envelope.LeaderID < 0 {
