@@ -25,6 +25,12 @@ type SumConfig struct {
 
 type Sum struct {
 	mu                  sync.Mutex
+	lifecycleMu         sync.Mutex
+	shutdownDone        chan struct{}
+	shutdownErr         error
+	running             bool
+	retryStopping       bool
+	activeRetries       sync.WaitGroup
 	inputQueue          middleware.Middleware
 	outputExchange      middleware.RoutedMiddleware
 	controlInput        middleware.Middleware
@@ -110,21 +116,112 @@ func NewSum(config SumConfig) (*Sum, error) {
 	}, nil
 }
 
-func (sum *Sum) Run() {
+func (sum *Sum) Run() error {
+	sum.lifecycleMu.Lock()
+	if sum.shutdownDone != nil || sum.running {
+		sum.lifecycleMu.Unlock()
+		return sum.Shutdown()
+	}
+	sum.running = true
+	sum.lifecycleMu.Unlock()
+	var controlDone chan error
 	if sum.controlInput != nil {
+		controlDone = make(chan error, 1)
 		go func() {
-			if err := sum.controlInput.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+			controlDone <- sum.controlInput.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 				sum.handleControlMessage(msg, ack, nack)
-			}); err != nil {
-				slog.Error("While consuming Sum control queue", "err", err)
-			}
+			})
 		}()
 	}
-	if err := sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-		sum.handleMessage(msg, ack, nack)
-	}); err != nil {
-		slog.Error("While consuming Sum input queue", "err", err)
+	inputDone := make(chan error, 1)
+	go func() {
+		inputDone <- sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+			sum.handleMessage(msg, ack, nack)
+		})
+	}()
+	var inputErr, controlErr error
+	var controlFirst bool
+	if controlDone != nil {
+		select {
+		case inputErr = <-inputDone:
+		case controlErr = <-controlDone:
+			controlFirst = true
+		}
+	} else {
+		inputErr = <-inputDone
 	}
+	sum.lifecycleMu.Lock()
+	stopping := sum.shutdownDone != nil
+	sum.lifecycleMu.Unlock()
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- sum.Shutdown() }()
+	if controlFirst {
+		inputErr = <-inputDone
+	} else if controlDone != nil {
+		controlErr = <-controlDone
+	}
+	closeErr := <-closeDone
+	if inputErr != nil && (!stopping || !errors.Is(inputErr, middleware.ErrMessageMiddlewareDisconnected)) {
+		slog.Error("While consuming Sum input queue", "err", inputErr)
+	}
+	if controlErr != nil && (!stopping || !errors.Is(controlErr, middleware.ErrMessageMiddlewareDisconnected)) {
+		slog.Error("While consuming Sum control queue", "err", controlErr)
+	}
+	if inputErr != nil && (!stopping || !errors.Is(inputErr, middleware.ErrMessageMiddlewareDisconnected)) {
+		return inputErr
+	}
+	if controlErr != nil && (!stopping || !errors.Is(controlErr, middleware.ErrMessageMiddlewareDisconnected)) {
+		return controlErr
+	}
+	return closeErr
+}
+
+func (sum *Sum) Shutdown() error {
+	sum.lifecycleMu.Lock()
+	if done := sum.shutdownDone; done != nil {
+		sum.lifecycleMu.Unlock()
+		<-done
+		return sum.shutdownErr
+	}
+	sum.shutdownDone = make(chan struct{})
+	done := sum.shutdownDone
+	sum.mu.Lock()
+	sum.retryStopping = true
+	var cancels []countRetryCancel
+	for _, barrier := range sum.barriers {
+		barrier.timerGeneration++
+		barrier.timerPending = false
+		if barrier.timerCancel != nil {
+			cancels = append(cancels, barrier.timerCancel)
+			barrier.timerCancel = nil
+		}
+	}
+	sum.mu.Unlock()
+	sum.lifecycleMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	var firstErr error
+	if err := sum.inputQueue.Close(); err != nil {
+		firstErr = err
+	}
+	if sum.controlInput != nil {
+		if err := sum.controlInput.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	sum.activeRetries.Wait()
+	if err := sum.outputExchange.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := sum.controlOutput.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	sum.lifecycleMu.Lock()
+	sum.shutdownErr = firstErr
+	close(done)
+	sum.lifecycleMu.Unlock()
+	return firstErr
 }
 
 func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
