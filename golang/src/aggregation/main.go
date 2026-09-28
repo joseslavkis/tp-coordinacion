@@ -4,7 +4,9 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/aggregation"
 )
@@ -69,6 +71,9 @@ func loadConfig() (aggregation.AggregationConfig, error) {
 }
 
 func run() int {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGTERM)
+	defer signal.Stop(signals)
 	config, err := loadConfig()
 	if err != nil {
 		slog.Error("While loading config", "err", err)
@@ -81,7 +86,19 @@ func run() int {
 		return 1
 	}
 
-	server.Run()
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-signals:
+			server.Shutdown()
+		case <-stop:
+		}
+	}()
+	if err := server.Run(); err != nil {
+		slog.Error("While shutting down aggregation", "err", err)
+		return 1
+	}
 	return 0
 }
 
