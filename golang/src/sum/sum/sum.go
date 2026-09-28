@@ -69,16 +69,10 @@ func NewSum(config SumConfig) (*Sum, error) {
 	for i := range config.AggregationAmount {
 		outputExchangeRouteKeys[i] = fmt.Sprintf("%s_%d", config.AggregationPrefix, i)
 	}
-	outputExchange, err := middleware.CreateExchangeMiddleware(config.AggregationPrefix, outputExchangeRouteKeys, connSettings)
+	outputExchange, err := middleware.CreateRoutedQueueMiddleware(config.AggregationPrefix, outputExchangeRouteKeys, connSettings)
 	if err != nil {
 		inputQueue.Close()
 		return nil, err
-	}
-	routedExchange, ok := outputExchange.(middleware.RoutedMiddleware)
-	if !ok {
-		outputExchange.Close()
-		inputQueue.Close()
-		return nil, errors.New("sum output exchange does not support routed publishing")
 	}
 
 	controlInput, err := middleware.CreateQueueMiddleware(controlQueueName(config.SumPrefix, config.Id), connSettings)
@@ -97,7 +91,7 @@ func NewSum(config SumConfig) (*Sum, error) {
 
 	return &Sum{
 		inputQueue:        inputQueue,
-		outputExchange:    routedExchange,
+		outputExchange:    outputExchange,
 		controlInput:      controlInput,
 		controlOutput:     controlOutput,
 		id:                config.Id,
