@@ -88,7 +88,6 @@ func successorID(id, sumAmount int) int {
 }
 
 func leaderForClient(clientID string, sumAmount int) int {
-	// CRC32/IEEE is stable across processes and keeps existing client-a fixtures on Sum 0.
 	return int(uint64(crc32.ChecksumIEEE([]byte(clientID))) % uint64(sumAmount))
 }
 
@@ -187,7 +186,6 @@ func defaultCountRetryScheduler(delay time.Duration, callback func()) countRetry
 	return func() { timer.Stop() }
 }
 
-// Only the incomplete-round timer may advance a returned COUNT to the next round.
 func (sum *Sum) startCountRound(clientID string, advance bool) error {
 	sum.mu.Lock()
 	barrier := sum.barriers[clientID]
