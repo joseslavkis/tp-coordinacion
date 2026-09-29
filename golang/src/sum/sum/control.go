@@ -408,7 +408,7 @@ func (sum *Sum) handleReturnedCount(key tokenKey, envelope inner.Envelope) error
 func (sum *Sum) scheduleCountRetry(clientID string, previousRound uint64, attempt uint) {
 	sum.mu.Lock()
 	barrier := sum.barriers[clientID]
-	if barrier == nil || barrier.barrierPassed || barrier.round != previousRound || barrier.timerPending {
+	if sum.retryStopping || barrier == nil || barrier.barrierPassed || barrier.round != previousRound || barrier.timerPending {
 		sum.mu.Unlock()
 		return
 	}
@@ -436,6 +436,12 @@ func (sum *Sum) scheduleCountRetry(clientID string, previousRound uint64, attemp
 
 func (sum *Sum) retryCountRound(clientID string, previousRound, generation uint64, expectedBarrier *clientBarrierState) {
 	sum.mu.Lock()
+	if sum.retryStopping {
+		sum.mu.Unlock()
+		return
+	}
+	sum.activeRetries.Add(1)
+	defer sum.activeRetries.Done()
 	barrier := sum.barriers[clientID]
 	if barrier != expectedBarrier || barrier.barrierPassed || barrier.round != previousRound || !barrier.timerPending || barrier.timerGeneration != generation {
 		sum.mu.Unlock()

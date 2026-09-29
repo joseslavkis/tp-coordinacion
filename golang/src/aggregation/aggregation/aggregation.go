@@ -50,6 +50,10 @@ func (err *poisonError) Unwrap() error {
 
 type Aggregation struct {
 	mu                  sync.Mutex
+	lifecycleMu         sync.Mutex
+	shutdownDone        chan struct{}
+	shutdownErr         error
+	running             bool
 	outputQueue         middleware.Middleware
 	inputExchange       middleware.Middleware
 	topSize             int
@@ -97,12 +101,51 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 	}, nil
 }
 
-func (aggregation *Aggregation) Run() {
-	if err := aggregation.inputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+func (aggregation *Aggregation) Run() error {
+	aggregation.lifecycleMu.Lock()
+	if aggregation.shutdownDone != nil || aggregation.running {
+		aggregation.lifecycleMu.Unlock()
+		return aggregation.Shutdown()
+	}
+	aggregation.running = true
+	aggregation.lifecycleMu.Unlock()
+	err := aggregation.inputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		aggregation.handleMessage(msg, ack, nack)
-	}); err != nil {
+	})
+	aggregation.lifecycleMu.Lock()
+	stopping := aggregation.shutdownDone != nil
+	aggregation.lifecycleMu.Unlock()
+	if err != nil && (!stopping || !errors.Is(err, middleware.ErrMessageMiddlewareDisconnected)) {
 		slog.Error("While consuming Aggregation completion exchange", "err", err)
 	}
+	closeErr := aggregation.Shutdown()
+	if err != nil && (!stopping || !errors.Is(err, middleware.ErrMessageMiddlewareDisconnected)) {
+		return err
+	}
+	return closeErr
+}
+
+func (aggregation *Aggregation) Shutdown() error {
+	aggregation.lifecycleMu.Lock()
+	if done := aggregation.shutdownDone; done != nil {
+		aggregation.lifecycleMu.Unlock()
+		<-done
+		return aggregation.shutdownErr
+	}
+	aggregation.shutdownDone = make(chan struct{})
+	done := aggregation.shutdownDone
+	aggregation.lifecycleMu.Unlock()
+	inputErr := aggregation.inputExchange.Close()
+	outputErr := aggregation.outputQueue.Close()
+	aggregation.lifecycleMu.Lock()
+	if inputErr != nil {
+		aggregation.shutdownErr = inputErr
+	} else {
+		aggregation.shutdownErr = outputErr
+	}
+	close(done)
+	aggregation.lifecycleMu.Unlock()
+	return aggregation.shutdownErr
 }
 
 func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func(), nack func()) {

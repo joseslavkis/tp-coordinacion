@@ -26,6 +26,10 @@ type JoinConfig struct {
 
 type Join struct {
 	mu                  sync.Mutex
+	lifecycleMu         sync.Mutex
+	shutdownDone        chan struct{}
+	shutdownErr         error
+	running             bool
 	inputQueue          middleware.Middleware
 	outputQueue         middleware.Middleware
 	aggregationAmount   int
@@ -73,10 +77,48 @@ func NewJoin(config JoinConfig) (*Join, error) {
 	}, nil
 }
 
-func (join *Join) Run() {
-	join.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+func (join *Join) Run() error {
+	join.lifecycleMu.Lock()
+	if join.shutdownDone != nil || join.running {
+		join.lifecycleMu.Unlock()
+		return join.Shutdown()
+	}
+	join.running = true
+	join.lifecycleMu.Unlock()
+	err := join.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		join.handleMessage(msg, ack, nack)
 	})
+	join.lifecycleMu.Lock()
+	stopping := join.shutdownDone != nil
+	join.lifecycleMu.Unlock()
+	closeErr := join.Shutdown()
+	if err != nil && (!stopping || !errors.Is(err, middleware.ErrMessageMiddlewareDisconnected)) {
+		return err
+	}
+	return closeErr
+}
+
+func (join *Join) Shutdown() error {
+	join.lifecycleMu.Lock()
+	if done := join.shutdownDone; done != nil {
+		join.lifecycleMu.Unlock()
+		<-done
+		return join.shutdownErr
+	}
+	join.shutdownDone = make(chan struct{})
+	done := join.shutdownDone
+	join.lifecycleMu.Unlock()
+	inputErr := join.inputQueue.Close()
+	outputErr := join.outputQueue.Close()
+	join.lifecycleMu.Lock()
+	if inputErr != nil {
+		join.shutdownErr = inputErr
+	} else {
+		join.shutdownErr = outputErr
+	}
+	close(done)
+	join.lifecycleMu.Unlock()
+	return join.shutdownErr
 }
 
 func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) {
