@@ -18,6 +18,16 @@ Si todavía faltan mensajes por procesar, se inicia una nueva ronda luego de una
 Durante FINISH, cada instancia de Sum prepara sus resultados parciales y los envía a las instancias de Aggregation correspondientes. De esta forma, la finalización de un cliente no depende de qué réplica haya recibido el EOF, y se garantiza que todos los datos hayan sido procesados antes de avanzar a la siguiente etapa.
 ## Coordinación entre Sum y Aggregation
 
+Una vez finalizada la coordinación entre las instancias de Sum, cada una de ellas debe enviar sus resultados parciales hacia las instancias de Aggregation.
+Para distribuir la información se utiliza un criterio determinístico de particionado basado en la combinación entre el clientID y la fruta. De esta forma, todos los aportes correspondientes a una misma fruta de un mismo cliente son enviados siempre a la misma instancia de Aggregation.
+Este particionado permite evitar el broadcast completo de datos. En lugar de enviar todos los resultados de cada Sum a todos los Aggregators, cada registro agregado se dirige únicamente al Aggregator responsable de ese shard.
+
+Cada instancia de Sum envía una contribución PARTIAL a cada Aggregator una vez finalizada la etapa de recolección de información. Los Aggregators pueden comenzar a procesar estas contribuciones a medida que llegan, pero para determinar que su partición está completa necesitan saber que recibieron la contribución de todas las instancias de Sum. Por este motivo, cuando un Sum no posee registros para un determinado shard envía igualmente un PARTIAL vacío. De esta forma, la recepción de un PARTIAL por cada Sum funciona también como mecanismo de finalización de la partición.
+
+Cada Aggregator mantiene estado separado por cliente y espera recibir un PARTIAL de cada instancia de Sum. A medida que llegan los mensajes, consolida los registros correspondientes a una misma fruta. Una vez recibidas todas las contribuciones, considera completa su partición para ese cliente y puede avanzar al cálculo de su top parcial.
+
+Además, las colas utilizadas entre Sum y Aggregation son estables, por lo que un Sum puede publicar un PARTIAL aunque el Aggregator todavía no haya comenzado a consumir. El mensaje permanece en RabbitMQ hasta que la instancia correspondiente esté disponible.
+
 ## Coordinación entre Aggregation y Join
 
 ## Escalabilidad
